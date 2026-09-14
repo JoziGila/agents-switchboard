@@ -22,7 +22,7 @@ Neither client can choose a provider per subagent. Codex discards `model_provide
 
 ## Status
 
-Specification stage. See [SPEC.md](SPEC.md) for the design, the verified client internals it depends on, and the roadmap. Phase 1 (routing, catalog, installer, roles, doctor, test) is next.
+Phase 1 is implemented: router with both pass-throughs, both DeepSeek adapters, Codex catalog injection, WebSocket decline, installer for both clients, role files, delegation policy, `doctor`, `test`, `status`. Verified end to end with the real Codex CLI through the router against ChatGPT. Not yet published to npm; run from a checkout with `node bin/switchboard.js <command>`. See [SPEC.md](SPEC.md) for the design and roadmap.
 
 ## Requirements
 

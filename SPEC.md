@@ -1,6 +1,6 @@
 # agents-switchboard — Specification
 
-Status: draft v0.3, 2026-09-14. Both base-URL contracts verified live on this machine (§2.1).
+Status: v0.4, 2026-09-14. Both base-URL contracts verified live (§2.1); phase 1 implemented and exercised against the real Codex CLI through the router.
 Reviewed against: openai/codex `main` @ 2f8603f (CLI 0.154.0, desktop runtime 0.154.0-alpha.6.2); Claude Code 2.1.270 and its gateway protocol docs; DeepSeek API docs (Responses API, Anthropic-compatible API, context caching, pricing) as of 2026-09-14.
 
 ## 1. Summary
@@ -271,6 +271,8 @@ multi_agent_v2 = false
 # <<< agents-switchboard <<<
 ```
 
+The installer does not write this as one literal block: TOML puts a top-level key after any table header inside that table, and a second `[features]` header is an error. It inserts `openai_base_url` on its own marker-guarded line before the first table header, merges the `[agents]` and `[features]` keys into existing tables when present, and appends the tables inside the block otherwise. The parsed result is exactly the above. A managed key already present with a different value is reported as a conflict, not overwritten.
+
 `multi_agent_v2` stays off in phase 1: v2 leans on server-side turn state and incremental appends that only the OpenAI backend implements, while v1 sends complete histories. Re-enabling is a phase 3 verification item.
 
 Role files in `~/.codex/agents/`, named after the built-in roles so they replace them:
@@ -430,6 +432,7 @@ model = "deepseek-flash"
 - Requests without `Authorization` or `x-api-key` on a pass-through route are rejected, so a stray local process cannot reach ChatGPT or Anthropic anonymously through the router. Tokens are not validated locally; the upstream does that.
 - The ChatGPT token goes only to `chatgpt.com`, the Anthropic OAuth token only to `api.anthropic.com`, the DeepSeek key only to `api.deepseek.com`. Hosts are pinned in code and overridable only in the switchboard's own config file, created with user-only permissions.
 - Bodies are streamed, never stored. Logs hold metadata only.
+- The router never answers a client with HTTP 401. Both clients treat a 401 from their backend as an expired login and start a token refresh; observed with Codex, which reported a revoked refresh token after a single 401 from the router. A missing or rejected DeepSeek key is reported as a 400 with an explanatory message.
 - This is a local transparent proxy under your own credentials, the same shape as the LLM gateways both vendors document. It is not credential sharing. Either vendor could still restrict the pattern; `doctor` detects the failure modes (rejected `version` header, rejected base URL, 401 on OAuth) and says so plainly.
 
 ## 14. Compatibility

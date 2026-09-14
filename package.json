@@ -9,7 +9,7 @@
   "files": ["bin", "src", "catalog", "README.md", "SPEC.md", "LICENSE"],
   "engines": { "node": ">=22.15" },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test 'test/*.test.js'",
     "start": "node bin/switchboard.js serve"
   },
   "dependencies": {
