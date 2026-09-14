@@ -43,7 +43,7 @@ test('failover state expires and resets', () => {
   assert.equal(s.isActive('claude', now), false);
   assert.equal(s.isActive('codex', now + 61_000), false);
   s.activate('claude', new Date(now + 60_000), 'limit');
-  assert.deepEqual(Object.keys(s.snapshot(now + 61_000)), ['claude']);
+  assert.deepEqual(Object.keys(s.snapshot(now)), ['claude']);
   s.reset();
   assert.deepEqual(s.snapshot(now), {});
 });
