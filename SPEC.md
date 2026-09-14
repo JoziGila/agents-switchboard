@@ -1,6 +1,6 @@
 # agents-switchboard — Specification
 
-Status: draft v0.2, 2026-09-14.
+Status: draft v0.3, 2026-09-14. Both base-URL contracts verified live on this machine (§2.1).
 Reviewed against: openai/codex `main` @ 2f8603f (CLI 0.154.0, desktop runtime 0.154.0-alpha.6.2); Claude Code 2.1.270 and its gateway protocol docs; DeepSeek API docs (Responses API, Anthropic-compatible API, context caching, pricing) as of 2026-09-14.
 
 ## 1. Summary
@@ -45,6 +45,13 @@ Both clients, however, let the one provider they use be re-pointed while keeping
 - Claude Code: `ANTHROPIC_BASE_URL` set without any credential variable routes through the gateway while "a saved claude.ai login stays the active credential, so the subscription's usage limits and billing apply". The OAuth capability travels in the `anthropic-beta` header, which the gateway forwards verbatim (gateway protocol doc).
 
 A loopback router at those URLs receives every request each client makes, with the user's own token, and dispatches by model. That is the whole trick.
+
+### 2.1 Verified on the wire
+
+Captured on 2026-09-14 by pointing each client at a local listener that rejected every request:
+
+- Codex 0.154.0 with `openai_base_url` set to a `/backend-api/codex` URL sent `GET /models?client_version=0.154.0`, then a WebSocket upgrade on `/responses`, then after the 426 an HTTP `POST /responses`. Every request carried `Authorization: Bearer <ChatGPT JWT>` and `chatgpt-account-id`. The POST body is `content-encoding: zstd`, and both the upgrade and the POST carry `x-codex-routing-hint: model=<slug>`. So the router can route GPT traffic, including the WebSocket, from a header without touching the body, and only decompresses bodies it rewrites.
+- Claude Code 2.1.270 with `ANTHROPIC_BASE_URL` set and no credential variable sent `HEAD /api/hello`, then `POST /v1/messages?beta=true` with `Authorization: Bearer sk-ant-oat01-…` (the claude.ai OAuth token) and `anthropic-beta` containing `oauth-2025-04-20`. The first call was the session-title request (`thinking: disabled`, `output_config.format` json schema); the main call carried `thinking: {type: "adaptive", display: "omitted"}`, `context_management` edits, `output_config.effort`, a three-block `system` with the attribution block first and 1 h `cache_control` on the other two, and a mid-conversation `role: "system"` message.
 
 ## 3. Architecture
 
@@ -91,7 +98,7 @@ Runtime: Node 22+, no native modules, single npm package `agents-switchboard`, b
 | Codex | `GET /backend-api/codex/models` | OpenAI | Proxy, merge catalog, rewrite ETag (§5.1). |
 | Codex | `POST /backend-api/codex/responses`, DeepSeek model | DeepSeek | Responses adapter (§6). |
 | Codex | `POST /backend-api/codex/responses`, other model | OpenAI | Pass-through; failover hook (§8). |
-| Codex | WebSocket upgrade on `/responses` | none | 426; Codex drops to HTTP for that session (§7). |
+| Codex | WebSocket upgrade on `/responses` | none | 426; Codex drops to HTTP for that session (§7). The upgrade carries `x-codex-routing-hint`, so phase 3 can splice GPT sockets through. |
 | Codex | anything else under `/backend-api/codex/` | OpenAI | Pass-through: usage, compaction, realtime, connectors, memories. |
 | Claude | `POST /anthropic/v1/messages`, DeepSeek model | DeepSeek | Messages adapter (§6). |
 | Claude | `POST /anthropic/v1/messages`, other model | Anthropic | Pass-through; failover hook (§8). |
@@ -100,7 +107,7 @@ Runtime: Node 22+, no native modules, single npm package `agents-switchboard`, b
 | Claude | anything else under `/anthropic/` | Anthropic | Pass-through. |
 | any | `/switchboard/*` | local | Status and control. |
 
-A model is DeepSeek-bound when its id, after stripping a Claude-style `[1m]` suffix, appears in the DeepSeek catalog the switchboard serves. The catalog is the single source of truth for both the Codex picker entries and the routing decision, so a model can never be advertised without a route.
+A model is DeepSeek-bound when its id, after stripping a Claude-style `[1m]` suffix, appears in the DeepSeek catalog the switchboard serves. For Codex the id comes from the `x-codex-routing-hint` header, so GPT bodies are never decompressed; for Claude Code it comes from the JSON body. The catalog is the single source of truth for both the Codex picker entries and the routing decision, so a model can never be advertised without a route.
 
 ### 4.2 Pass-through contract
 
@@ -160,7 +167,7 @@ Request rewrite:
 1. `include`: remove `reasoning.encrypted_content`; drop the key if empty.
 2. `input`: delete `encrypted_content` from every `reasoning` item; remove items left empty. Relevant when a child is spawned with `fork_turns` from a GPT parent. Reasoning text that DeepSeek itself returned is never touched: DeepSeek recovers a turn's thinking signature by hashing that exact text, and its own harness replays it on every turn for that reason (docs/research/deepseek-harness-learnings.md).
 3. `tools`: keep `function` and the `apply_patch` custom tool. Flatten `namespace` wrappers into their members. Remove `web_search`, `image_generation`.
-4. Remove `store`, `prompt_cache_key`, `service_tier`, `safety_identifier`, `text.verbosity`. DeepSeek would ignore them; removing keeps the body identical across requests.
+4. Remove `store`, `prompt_cache_key`, `service_tier`, `safety_identifier`, `text`, `client_metadata`, and each input item's `internal_chat_message_metadata_passthrough`. DeepSeek would ignore them; removing keeps the body identical across requests. Bodies arrive zstd-compressed and are re-sent as plain JSON.
 5. `reasoning.effort`: pass low, high, max; map medium → high, xhigh → max, ultra → max.
 6. Everything else (`instructions`, `input` order, `parallel_tool_calls`, `stream`) untouched.
 
@@ -177,6 +184,8 @@ Request rewrite:
 3. `system` array and `messages` forwarded unchanged, including the attribution block (stable per conversation since Claude Code 2.1.181), `cache_control` markers, and every `thinking` block DeepSeek previously returned. Nothing is reordered or merged.
 4. Content blocks DeepSeek rejects (`document`, `search_result`, `redacted_thinking`) are dropped from `messages` with a log line. Text and tool blocks are never touched.
 5. `context_management`, `tool` beta fields (`strict`, `defer_loading`), `metadata` other than `user_id`: left in place. DeepSeek ignores unknown fields.
+6. Mid-conversation `role: "system"` messages (the `mid-conversation-system` beta) become `role: "user"` messages with the same content, since DeepSeek's endpoint accepts only user and assistant roles in `messages`.
+7. `output_config.format` (structured output, used by Claude Code's session-title call) is removed with a log line; DeepSeek supports only `effort` there. The title may then fail to parse, which Claude Code tolerates.
 
 Response handling:
 

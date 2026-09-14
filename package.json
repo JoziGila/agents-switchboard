@@ -1,0 +1,22 @@
+{
+  "name": "agents-switchboard",
+  "version": "0.1.0",
+  "description": "Loopback router that gives Codex and Claude Code native subagents on DeepSeek Flash while the main session keeps its subscription model.",
+  "license": "MIT",
+  "repository": "github:JoziGila/agents-switchboard",
+  "type": "module",
+  "bin": { "switchboard": "bin/switchboard.js" },
+  "files": ["bin", "src", "catalog", "README.md", "SPEC.md", "LICENSE"],
+  "engines": { "node": ">=22.15" },
+  "scripts": {
+    "test": "node --test test/",
+    "start": "node bin/switchboard.js serve"
+  },
+  "dependencies": {
+    "smol-toml": "^1.4.2"
+  },
+  "switchboard": {
+    "codexRange": ">=0.150.0 <0.156.0",
+    "claudeRange": ">=2.1.181"
+  }
+}
