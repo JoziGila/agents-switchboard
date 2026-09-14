@@ -41,7 +41,7 @@ test('catalog entries: bundled for deepseek slugs, generic with overrides for th
 });
 
 test('provenance is bounded and per provider', () => {
-  const p = createProvenance(2);
+  const p = createProvenance({ limit: 2 });
   p.remember('openrouter', 'a'); p.remember('openrouter', 'b'); p.remember('openrouter', 'c');
   assert.equal(p.has('openrouter', 'a'), false, 'oldest evicted');
   assert.equal(p.has('openrouter', 'c'), true);

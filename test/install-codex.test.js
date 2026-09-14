@@ -106,7 +106,7 @@ test('installCodex writes config, roles and AGENTS.md; uninstall restores', asyn
     const explorer = read(path.join(home, 'agents', 'explorer.toml'));
     assert.match(explorer, /^# managed by agents-switchboard\n/);
     assert.equal(parse(explorer).model, 'deepseek-flash');
-    assert.equal(parse(explorer).model_reasoning_effort, 'low');
+    assert.equal(parse(explorer).model_reasoning_effort, 'high');
     assert.equal(parse(read(path.join(home, 'agents', 'senior.toml'))).model, 'gpt-5.5');
     const md = read(path.join(home, 'AGENTS.md'));
     assert.match(md, /^# My rules\n\nBe nice\.\n\n<!-- agents-switchboard delegation policy -->/);

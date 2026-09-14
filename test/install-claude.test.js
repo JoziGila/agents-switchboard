@@ -88,7 +88,7 @@ test('installClaude writes settings, roles and CLAUDE.md; uninstall restores', a
     assert.equal(read(path.join(home, 'agents', 'reviewer.md')), '---\nname: reviewer\n---\nmine\n');
     const explorer = read(path.join(home, 'agents', 'explorer.md'));
     assert.match(explorer, /^---\nname: explorer\n/);
-    assert.match(explorer, /\nmodel: deepseek-flash\[1m\]\ntools: Read, Grep, Glob, Bash\neffort: low\n---\n<!-- managed by agents-switchboard -->\nYou are an explorer\./);
+    assert.match(explorer, /\nmodel: deepseek-flash\[1m\]\ntools: Read, Grep, Glob, Bash\neffort: high\n---\n<!-- managed by agents-switchboard -->\nYou are an explorer\./);
     assert.match(read(path.join(home, 'agents', 'senior.md')), /\nmodel: inherit\n/);
     assert.doesNotMatch(read(path.join(home, 'agents', 'worker.md')), /\ntools:/);
     assert.match(read(path.join(home, 'CLAUDE.md')), /^# Global\n\n<!-- agents-switchboard delegation policy -->/);
