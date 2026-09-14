@@ -128,6 +128,23 @@ export function writeRoleFiles({ dir, extension, marker, afterFrontmatter, roles
 }
 
 /**
+ * What writeRoleFiles would report, without touching the filesystem.
+ * @param {RoleFileSpec} spec
+ * @returns {Record<string, 'written'|'unchanged'|'skipped'>}
+ */
+export function previewRoles({ dir, extension, marker, afterFrontmatter, roles, render }) {
+  const report = {};
+  for (const [name, role] of Object.entries(roles)) {
+    const file = path.join(dir, name + extension);
+    const content = render(name, role);
+    if (!fs.existsSync(file)) { report[name] = 'written'; continue; }
+    const current = fs.readFileSync(file, 'utf8');
+    report[name] = !isManaged(current, marker, afterFrontmatter) ? 'skipped' : current === content ? 'unchanged' : 'written';
+  }
+  return report;
+}
+
+/**
  * Remove every managed role file.
  * @param {Pick<RoleFileSpec, 'dir'|'extension'|'marker'|'afterFrontmatter'> & { names: string[] }} spec
  * @returns {Record<string, 'removed'|'kept'>}

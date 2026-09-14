@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parse } from 'smol-toml';
-import { applyCodexConfig, stripManaged, installCodex, uninstallCodex } from '../src/install/codex.js';
+import { applyCodexConfig, stripManaged, installCodex, uninstallCodex, findWarnings, hasManaged } from '../src/install/codex.js';
 import { tempHome, read, write } from './helpers.js';
 
 const URL = 'http://127.0.0.1:4141/backend-api/codex';
@@ -78,6 +78,8 @@ test('conflicts are reported and nothing is produced', () => {
     ['model_catalog_json = "~/.codex/models.json"\n', 'model_catalog_json'],
     ['openai_base_url = "https://other.example/v1"\n', 'openai_base_url'],
     ['[agents]\ndefault_subagent_model = "gpt-5.5"\n', 'agents.default_subagent_model'],
+    ['agents = { max_threads = 4 }\n', 'agents written as an inline table'],
+    ['features = "on"\n', 'features written as an inline table'],
   ]) {
     assert.throws(() => applyCodexConfig(text, 4141), new RegExp(needle), text);
   }
@@ -134,13 +136,73 @@ test('installCodex writes config, roles and AGENTS.md; uninstall restores', asyn
   }
 });
 
-test('dryRun writes nothing', async () => {
+test('dryRun writes nothing but previews roles and the block', async () => {
   const { paths, cleanup } = tempHome();
   try {
+    write(path.join(paths.codexHome, 'agents', 'worker.toml'), 'name = "worker"\n');
     const r = await installCodex({ paths, port: 4141, dryRun: true });
     assert.equal(r.dryRun, true);
+    assert.equal(r.roles.explorer, 'written');
+    assert.equal(r.roles.worker, 'skipped');
+    assert.equal(r.agentsMd, true);
     assert.equal(fs.existsSync(path.join(paths.codexHome, 'config.toml')), false);
+    assert.equal(fs.existsSync(path.join(paths.codexHome, 'agents', 'explorer.toml')), false);
   } finally {
     cleanup();
+  }
+});
+
+test('invalid TOML is reported by name, not as a parser stack', () => {
+  assert.throws(() => applyCodexConfig('model = \n', 4141), /config\.toml is not valid TOML/);
+});
+
+test('role files carry no sandbox_mode: Codex ignores it', async () => {
+  const { paths, cleanup } = tempHome();
+  try {
+    await installCodex({ paths, port: 4141 });
+    for (const name of ['explorer', 'worker', 'reviewer', 'senior']) {
+      const text = read(path.join(paths.codexHome, 'agents', `${name}.toml`));
+      assert.doesNotMatch(text, /sandbox_mode/);
+      assert.ok(parse(text).developer_instructions.length > 50);
+    }
+    assert.match(read(path.join(paths.codexHome, 'agents', 'worker.toml')), /never revert, reformat or clean up code you did not write/);
+  } finally { cleanup(); }
+});
+
+test('warnings: context_management.experimental_mode costs cache hits', () => {
+  assert.deepEqual(findWarnings(''), []);
+  assert.deepEqual(findWarnings('model = "x"\n'), []);
+  assert.match(findWarnings('[features]\ncontext_management.experimental_mode = true\n')[0], /experimental_mode/);
+  assert.match(findWarnings('[context_management]\nexperimental_mode = true\n')[0], /experimental_mode/);
+});
+
+test('uninstall is a byte-exact no-op on a file the installer never touched', async () => {
+  const { paths, cleanup } = tempHome();
+  try {
+    const original = 'model = "gpt-5.5"\n\n\n\n[features]\nhooks = true\n';
+    write(path.join(paths.codexHome, 'config.toml'), original);
+    assert.equal(hasManaged(original), false);
+    const u = await uninstallCodex({ paths });
+    assert.equal(u.configChanged, false);
+    assert.equal(read(path.join(paths.codexHome, 'config.toml')), original, 'blank runs preserved, nothing rewritten');
+    assert.equal(fs.existsSync(paths.backupsDir), false, 'no backup taken');
+  } finally { cleanup(); }
+});
+
+test('install then uninstall round-trips the original bytes, including a file with no tables', async () => {
+  for (const original of [
+    'model = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\n\n[features]\nhooks = true\n\n[projects."/a"]\ntrust_level = "trusted"\n',
+    'model = "gpt-5.5"\n',
+    '',
+    '# comment only\n\n[mcp_servers.x]\nurl = "http://x"\n',
+  ]) {
+    const { paths, cleanup } = tempHome();
+    try {
+      write(path.join(paths.codexHome, 'config.toml'), original);
+      await installCodex({ paths, port: 4141 });
+      assert.equal(hasManaged(read(path.join(paths.codexHome, 'config.toml'))), true);
+      await uninstallCodex({ paths });
+      assert.equal(read(path.join(paths.codexHome, 'config.toml')), original, JSON.stringify(original));
+    } finally { cleanup(); }
   }
 });

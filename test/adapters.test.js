@@ -4,6 +4,7 @@ import { rewriteResponsesRequest, mapDeepSeekError, usageFromResponsesEvent } fr
 import { rewriteMessagesRequest, hasUnsignedThinking, stripUnsignedThinking, normalizeSseData } from '../src/adapters/messages.js';
 import { isDeepSeekModel, mergeModels, rewriteEtag, deepseekEntries } from '../src/catalog.js';
 import * as adaptersForAgentMessage from '../src/adapters/responses.js';
+import * as messagesForUsage from '../src/adapters/messages.js';
 
 const codexBody = {
   model: 'deepseek-flash', instructions: 'You are Codex', stream: true, store: false,
@@ -33,7 +34,7 @@ test('responses adapter strips what DeepSeek cannot use and keeps the prefix', (
   assert.ok(!('internal_chat_message_metadata_passthrough' in out.input[0]));
   assert.ok(!('encrypted_content' in out.input[1]));
   assert.equal(out.input[1].summary[0].text, 'thought');
-  assert.deepEqual(out.tools.map((t) => t.name), ['exec_command', 'apply_patch', 'js']);
+  assert.deepEqual(out.tools.map((t) => t.name), ['exec_command', 'apply_patch', 'mcp__x__js']);
   assert.equal(codexBody.include.length, 1, 'input not mutated');
   assert.deepEqual(rewriteResponsesRequest(codexBody), out, 'deterministic');
 });
@@ -247,4 +248,32 @@ test('responses usage is normalised to the native shape for Codex', () => {
   assert.equal(u.input_tokens_details.cached_tokens, 90);
   assert.equal(u.output_tokens_details.reasoning_tokens, 0);
   assert.equal(normalizeResponsesSseData('{"type":"response.output_text.delta","delta":"x"}'), '{"type":"response.output_text.delta","delta":"x"}');
+});
+
+test('namespaced tools are encoded on the wire and decoded back into namespace + name', () => {
+  const { rewriteResponsesRequest, namespacedToolMap, codexSseMapper } = adaptersForAgentMessage;
+  const tools = [{ type: 'namespace', name: 'collaboration', description: 'Agents', tools: [{ type: 'function', name: 'spawn_agent', description: 'Spawn', parameters: {} }] }, { type: 'namespace', name: 'mcp__cua_repl', tools: [{ type: 'function', name: 'js' }] }, { type: 'function', name: 'exec_command' }];
+  const out = rewriteResponsesRequest({ model: 'deepseek-flash', tools, input: [{ type: 'function_call', name: 'spawn_agent', namespace: 'collaboration', call_id: 'c1', arguments: '{}' }] });
+  assert.deepEqual(out.tools.map((t) => t.name), ['collaboration__spawn_agent', 'mcp__cua_repl__js', 'exec_command']);
+  assert.match(out.tools[0].description, /^\[collaboration\] Spawn/);
+  assert.equal(out.input[0].name, 'collaboration__spawn_agent');
+  assert.ok(!('namespace' in out.input[0]));
+  const map = namespacedToolMap(tools);
+  const mapper = codexSseMapper(map);
+  const added = mapper('{"type":"response.output_item.added","item":{"type":"function_call","name":"mcp__cua_repl__js","call_id":"c2","arguments":""}}');
+  assert.deepEqual(JSON.parse(added).item, { type: 'function_call', name: 'js', namespace: 'mcp__cua_repl', call_id: 'c2', arguments: '' });
+  const done = mapper('{"type":"response.completed","response":{"output":[{"type":"function_call","name":"exec_command"}],"usage":{"input_tokens":1,"output_tokens":1}}}');
+  const j = JSON.parse(done);
+  assert.equal(j.response.output[0].name, 'exec_command');
+  assert.equal(j.response.usage.total_tokens, 2);
+});
+
+test('anthropic usage: message_delta with only output_tokens does not zero earlier counts; input is the full prompt', () => {
+  const { usageFromMessagesEvent } = messagesForUsage;
+  const start = usageFromMessagesEvent({ type: 'message_start', message: { usage: { input_tokens: 12, cache_read_input_tokens: 40000, cache_creation_input_tokens: 900, output_tokens: 1 } } });
+  assert.deepEqual(start, { input: 40912, cached: 40000, output: 1 });
+  const delta = usageFromMessagesEvent({ type: 'message_delta', usage: { output_tokens: 250 } });
+  assert.deepEqual(delta, { output: 250 });
+  const merged = { ...start, ...delta };
+  assert.deepEqual(merged, { input: 40912, cached: 40000, output: 250 });
 });

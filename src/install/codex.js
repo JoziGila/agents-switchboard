@@ -4,8 +4,8 @@ import path from 'node:path';
 import { parse } from 'smol-toml';
 import { DEFAULT_PORT } from '../config.js';
 import { resolvePaths } from '../paths.js';
-import { backupFile, latestBackup, readTextOr, writeRoleFiles, removeRoleFiles, upsertDelegationFile, removeDelegationFile } from './files.js';
-import { codexRoles, renderCodexRole, MANAGED_TOML, ROLE_NAMES } from './roles.js';
+import { backupFile, latestBackup, readTextOr, writeRoleFiles, removeRoleFiles, previewRoles, upsertDelegationFile, removeDelegationFile } from './files.js';
+import { codexRoles, renderCodexRole, MANAGED_TOML, ROLE_NAMES, upsertDelegation } from './roles.js';
 
 const BLOCK_START = '# >>> agents-switchboard >>>';
 const BLOCK_END = '# <<< agents-switchboard <<<';
@@ -33,6 +33,7 @@ export function baseUrlFor(port) {
 }
 
 const isHeader = (line) => /^\s*\[/.test(line);
+const isTableValue = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const headerName = (line) => line.match(/^\s*\[\[?\s*([^\]]+?)\s*\]\]?/)?.[1].trim() ?? null;
 const tomlValue = (source) => parse(`x = ${source}`).x;
 
@@ -41,30 +42,38 @@ const tomlValue = (source) => parse(`x = ${source}`).x;
  * @param {string} text
  * @returns {string}
  */
-export function stripManaged(text) {
+export function stripManaged(text, { collapse = true } = {}) {
   const out = [];
   let skipUntil = null;
+  let dropBlankAfter = false; // insertBaseUrl adds one blank line after its block; take it back with the block
   for (const line of text.split('\n')) {
     const trimmed = line.trim();
     if (skipUntil) {
-      if (trimmed === skipUntil) skipUntil = null;
+      if (trimmed === skipUntil) { skipUntil = null; dropBlankAfter = trimmed === URL_END; }
       continue;
+    }
+    if (dropBlankAfter) {
+      dropBlankAfter = false;
+      if (trimmed === '' && out.at(-1)?.trim() === '') continue;
+      if (trimmed === '' && out.length === 0) continue;
     }
     if (trimmed === BLOCK_START) { skipUntil = BLOCK_END; continue; }
     if (trimmed === URL_START) { skipUntil = URL_END; continue; }
     if (trimmed.endsWith(LINE_TAG) && trimmed !== LINE_TAG) continue;
     out.push(line);
   }
-  return out.join('\n').replace(/\n{3,}/g, '\n\n');
+  const joined = out.join('\n');
+  return collapse ? joined.replace(/\n{3,}/g, '\n\n') : joined;
 }
 
 /**
  * Settings that would redirect or mask the provider, or that we would have to overwrite (SPEC §10). Pure.
  * @param {object} cfg parsed TOML with managed lines already stripped
  * @param {string} ourUrl
+ * @param {Set<string>} [inlineTables] managed table names written as `name = { ... }` or a scalar (see inlineTablesIn)
  * @returns {string[]} human-readable conflict descriptions, empty when none
  */
-export function findConflicts(cfg, ourUrl) {
+export function findConflicts(cfg, ourUrl, inlineTables = new Set()) {
   const conflicts = [];
   if (cfg.profile !== undefined) conflicts.push('profile');
   if (cfg.oss_provider !== undefined) conflicts.push('oss_provider');
@@ -72,6 +81,8 @@ export function findConflicts(cfg, ourUrl) {
   if (cfg.model_catalog_json !== undefined) conflicts.push('model_catalog_json');
   if (cfg.openai_base_url !== undefined && cfg.openai_base_url !== ourUrl) conflicts.push(`openai_base_url = "${cfg.openai_base_url}"`);
   for (const [table, keys] of Object.entries(MANAGED_TABLES)) {
+    // An inline table (`agents = { ... }`) or scalar cannot take our merged keys; treat it like a foreign value.
+    if (cfg[table] !== undefined && (inlineTables.has(table) || !isTableValue(cfg[table]))) { conflicts.push(`${table} written as an inline table or scalar; use a [${table}] header`); continue; }
     for (const [key, source] of keys) {
       const existing = cfg[table]?.[key];
       if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(tomlValue(source))) {
@@ -121,8 +132,8 @@ function mergeTable(lines, table, missing, appended) {
 export function applyCodexConfig(original, port) {
   const url = baseUrlFor(port);
   const clean = stripManaged(original);
-  const parsed = clean.trim() ? parse(clean) : {};
-  const conflicts = findConflicts(parsed, url);
+  const parsed = clean.trim() ? parseNamed(clean) : {};
+  const conflicts = findConflicts(parsed, url, inlineTablesIn(clean));
   if (conflicts.length) {
     throw new Error(`config.toml has settings the switchboard cannot coexist with: ${conflicts.join(', ')}. Remove them (or move them to a profile you do not use with the switchboard) and re-run.`);
   }
@@ -142,8 +153,38 @@ export function applyCodexConfig(original, port) {
   }
 
   const text = lines.join('\n').replace(/\n{3,}/g, '\n\n') + '\n';
-  parse(text); // must still be valid TOML
+  try {
+    parse(text);
+  } catch (e) {
+    throw new Error(`config.toml could not be merged (${e.message}); the switchboard's lines would leave it invalid. Move [agents] and [features] into standard table headers and re-run.`);
+  }
   return text;
+}
+
+/** Parse TOML, naming the file in the error instead of surfacing the parser's message alone. */
+function parseNamed(text) {
+  try {
+    return parse(text);
+  } catch (e) {
+    throw new Error(`config.toml is not valid TOML (${e.message}); fix it and re-run.`);
+  }
+}
+
+/**
+ * Names of managed tables that appear as `name = { ... }` (inline) or `name = <scalar>` at top level. Pure.
+ * @param {string} text
+ * @returns {Set<string>}
+ */
+export function inlineTablesIn(text) {
+  const names = new Set();
+  let inTable = false;
+  for (const line of text.split('\n')) {
+    if (isHeader(line)) { inTable = true; continue; }
+    if (inTable) continue;
+    const m = line.match(/^\s*([A-Za-z0-9_-]+)\s*=/);
+    if (m && Object.hasOwn(MANAGED_TABLES, m[1])) names.add(m[1]);
+  }
+  return names;
 }
 
 const roleSpec = (codexHome, pro) => ({
@@ -152,9 +193,24 @@ const roleSpec = (codexHome, pro) => ({
 });
 
 /**
+ * Settings that do not block the install but work against the DeepSeek prefix cache (SPEC §9).
+ * @param {string} text config.toml text
+ * @returns {string[]}
+ */
+export function findWarnings(text) {
+  let cfg = {};
+  try { cfg = text.trim() ? parse(stripManaged(text)) : {}; } catch { return []; /* reported as a conflict elsewhere */ }
+  const warnings = [];
+  if (cfg.context_management?.experimental_mode || cfg.features?.context_management?.experimental_mode) {
+    warnings.push('context_management.experimental_mode is on in config.toml; it rewrites history more often, which costs DeepSeek prefix-cache hits.');
+  }
+  return warnings;
+}
+
+/**
  * Install the Codex side.
  * @param {{ codexHome?: string, port?: number, dryRun?: boolean, pro?: boolean, paths?: import('../paths.js').Paths }} [opts]
- * @returns {Promise<{ configFile: string, configChanged: boolean, backup: string|null, roles: object, agentsMd: boolean, dryRun: boolean }>}
+ * @returns {Promise<{ configFile: string, configChanged: boolean, backup: string|null, roles: object, agentsMd: boolean, warnings: string[], dryRun: boolean }>}
  */
 export async function installCodex(opts = {}) {
   const paths = opts.paths || resolvePaths();
@@ -163,8 +219,11 @@ export async function installCodex(opts = {}) {
   const configFile = path.join(codexHome, 'config.toml');
   const original = readTextOr(configFile);
   const next = applyCodexConfig(original, port);
-  const report = { configFile, configChanged: next !== original, backup: null, roles: {}, agentsMd: false, dryRun: !!opts.dryRun };
-  if (opts.dryRun) return report;
+  const report = { configFile, configChanged: next !== original, backup: null, roles: {}, agentsMd: false, warnings: findWarnings(original), dryRun: !!opts.dryRun };
+  if (opts.dryRun) {
+    const agentsMd = path.join(codexHome, 'AGENTS.md');
+    return { ...report, roles: previewRoles(roleSpec(codexHome, opts.pro)), agentsMd: upsertDelegation(readTextOr(agentsMd)) !== readTextOr(agentsMd) };
+  }
 
   if (report.configChanged) {
     report.backup = backupFile(configFile, paths.backupsDir, 'codex-config.toml');
@@ -176,9 +235,14 @@ export async function installCodex(opts = {}) {
   return report;
 }
 
+/** Whether the text carries any line the installer wrote. */
+export function hasManaged(text) {
+  return text.split('\n').some((line) => { const t = line.trim(); return t === BLOCK_START || t === URL_START || (t.endsWith(LINE_TAG) && t !== LINE_TAG); });
+}
+
 /** Strip our lines; if the result is not valid TOML, fall back to the latest backup. */
 function revertedConfig(original, backupsDir) {
-  let next = stripManaged(original).replace(/^\n+/, '').replace(/\n+$/, '');
+  let next = stripManaged(original, { collapse: false }).replace(/^\n+/, '').replace(/\n+$/, '');
   if (next.length) next += '\n';
   try {
     parse(next);
@@ -201,7 +265,7 @@ export async function uninstallCodex(opts = {}) {
   const configFile = path.join(codexHome, 'config.toml');
   const report = { configFile, configChanged: false, restoredFromBackup: null, roles: {}, agentsMd: false };
 
-  if (fs.existsSync(configFile)) {
+  if (fs.existsSync(configFile) && hasManaged(fs.readFileSync(configFile, 'utf8'))) {
     const original = fs.readFileSync(configFile, 'utf8');
     const { next, restoredFromBackup } = revertedConfig(original, paths.backupsDir);
     report.restoredFromBackup = restoredFromBackup;

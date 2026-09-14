@@ -60,6 +60,7 @@ test('codex /models is merged and etag forked', async () => {
   const r = await fetch(base + '/backend-api/codex/models?client_version=0.154.0', { headers: { authorization: 'Bearer t' } });
   const j = await r.json();
   assert.deepEqual(j.models.map((m) => m.slug), ['gpt-5.5', 'deepseek-flash', 'deepseek-v4-pro', 'qwen/qwen3-coder']);
+  assert.ok(j.models.every((m) => m.multi_agent_version !== 'v2'), 'no entry is served as v2');
   assert.equal(j.models.at(-1).display_name, 'qwen3-coder');
   assert.match(r.headers.get('etag'), /^"up1\+sb[0-9a-f]{8}"$/);
   assert.equal(seen.openai.at(-1).headers.authorization, 'Bearer t');
@@ -129,6 +130,10 @@ test('claude unsigned thinking is stripped before anthropic', async () => {
 test('pass-through without credentials is refused; hello and count_tokens handled', async () => {
   const r = await post('/backend-api/codex/responses', '{}', { 'x-codex-routing-hint': 'model=gpt-5.5' });
   assert.equal(r.status, 401);
+  assert.equal((await post('/backend-api/codex/responses', '{}', { 'x-codex-routing-hint': 'model=deepseek-flash' })).status, 401, 'provider routes need the client credential too');
+  assert.equal((await fetch(base + '/backend-api/codex/models')).status, 401);
+  const big = await post('/anthropic/v1/messages', Buffer.alloc(33 * 1024 * 1024), { authorization: 'Bearer x' });
+  assert.equal(big.status, 413);
   assert.equal((await fetch(base + '/anthropic/api/hello', { method: 'HEAD' })).status, 200);
   const ct = await post('/anthropic/v1/messages/count_tokens', JSON.stringify({ model: 'deepseek-flash' }), { authorization: 'Bearer x' });
   assert.equal(ct.status, 404);
@@ -207,10 +212,11 @@ test('codex quota 429 fails the turn over to the fallback provider and stays the
   assert.deepEqual(sb.statusJson().failover.active, {});
 });
 
-test('a plain rate limit is relayed as 429, not failed over', async () => {
+test('a plain rate limit is relayed as 429 with its headers, not failed over', async () => {
   const body = zlib.zstdCompressSync(Buffer.from(JSON.stringify({ model: 'gpt-5.5', input: [] })));
   const r = await post('/backend-api/codex/responses', body, { 'content-encoding': 'zstd', authorization: 'Bearer t', 'x-codex-routing-hint': 'model=gpt-5.5', 'x-mock': 'ratelimit' });
   assert.equal(r.status, 429);
+  assert.equal(r.headers.get('retry-after'), '3');
   assert.equal((await r.json()).error.type, 'rate_limit_exceeded');
   assert.deepEqual(sb.statusJson().failover.active, {});
 });

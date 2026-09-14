@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { applyClaudeSettings, revertClaudeSettings, installClaude, uninstallClaude } from '../src/install/claude.js';
+import { applyClaudeSettings, revertClaudeSettings, installClaude, uninstallClaude, findWarnings, readSettings } from '../src/install/claude.js';
 import { tempHome, read, write } from './helpers.js';
 
 test('managed env keys are merged and recorded', () => {
@@ -12,16 +12,18 @@ test('managed env keys are merged and recorded', () => {
   assert.equal(settings.env.CLAUDE_CODE_SUBAGENT_MODEL, 'deepseek-flash[1m]');
   assert.equal(settings.env.ANTHROPIC_CUSTOM_MODEL_OPTION, 'deepseek-flash[1m]');
   assert.equal(settings.model, 'claude-fable-5-1');
-  assert.deepEqual(settings.modelSettings['deepseek-flash'], { effort: 'high' });
+  assert.equal(settings.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT, '1', 'effort must reach the unrecognised DeepSeek id');
+  assert.deepEqual(settings.modelSettings['deepseek-flash'], { effortLevel: 'high' });
   assert.equal(state.env.ANTHROPIC_BASE_URL, null, 'null records "we added it"');
   assert.equal(state.modelSettings, null);
 });
 
-test('overwritten values are restored on revert', () => {
-  const original = { env: { CLAUDE_CODE_SUBAGENT_MODEL: 'haiku' }, modelSettings: { 'deepseek-flash': { effort: 'low' }, 'claude-opus-5': { effort: 'max' } } };
+test('overwritten values are restored on revert; other modelSettings fields survive', () => {
+  const original = { env: { CLAUDE_CODE_SUBAGENT_MODEL: 'haiku' }, modelSettings: { 'deepseek-flash': { effortLevel: 'low', thinking: 'off' }, 'claude-opus-5': { effortLevel: 'max' } } };
   const { settings, state } = applyClaudeSettings(original, 4141);
   assert.equal(state.env.CLAUDE_CODE_SUBAGENT_MODEL, 'haiku');
-  assert.deepEqual(state.modelSettings, { effort: 'low' });
+  assert.equal(state.modelSettings, 'low', 'only our field is recorded');
+  assert.deepEqual(settings.modelSettings['deepseek-flash'], { effortLevel: 'high', thinking: 'off' }, 'merged, not replaced');
   assert.deepEqual(revertClaudeSettings(settings, state), original);
 });
 
@@ -43,6 +45,26 @@ test('conflicts are reported', () => {
   // our own earlier url on another port is not a conflict when state says we own it
   const prev = { env: { ANTHROPIC_BASE_URL: null } };
   assert.doesNotThrow(() => applyClaudeSettings({ env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:5000/anthropic' } }, 4141, prev));
+  // ...and also when state.json was lost: the loopback + /anthropic shape is ours by construction
+  assert.doesNotThrow(() => applyClaudeSettings({ env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:5000/anthropic' } }, 4141));
+  assert.throws(() => applyClaudeSettings({ env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:5000/other' } }, 4141), /ANTHROPIC_BASE_URL/);
+});
+
+test('warnings: shell credentials and the force variable, neither a hard conflict', () => {
+  assert.deepEqual(findWarnings({}, {}), []);
+  assert.equal(findWarnings({}, { ANTHROPIC_API_KEY: 'sk' }).length, 1);
+  assert.match(findWarnings({ env: { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: '1' } }, {})[0], /inherit/);
+  assert.match(findWarnings({}, { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: '1' })[0], /Explore and Plan/);
+  assert.doesNotThrow(() => applyClaudeSettings({ env: { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: '1' } }, 4141));
+});
+
+test('a corrupt settings.json is reported by name', () => {
+  const { home, cleanup } = tempHome();
+  try {
+    const file = path.join(home, 'settings.json');
+    write(file, '{ not json');
+    assert.throws(() => readSettings(file), /settings\.json is not valid JSON/);
+  } finally { cleanup(); }
 });
 
 test('installClaude writes settings, roles and CLAUDE.md; uninstall restores', async () => {
@@ -79,6 +101,8 @@ test('installClaude writes settings, roles and CLAUDE.md; uninstall restores', a
 
     const warn = await installClaude({ paths, port: 4141, env: { ANTHROPIC_API_KEY: 'sk' } });
     assert.equal(warn.warnings.length, 1);
+    assert.ok(fs.existsSync(path.join(home, 'agents', 'Explore.md')), 'built-in Explore is overridden');
+    assert.match(read(path.join(home, 'agents', 'Explore.md')), /\nmodel: deepseek-flash\[1m\]\n/);
 
     const u = await uninstallClaude({ paths });
     assert.equal(u.settingsChanged, true);
@@ -99,8 +123,22 @@ test('installClaude on a machine without settings.json creates it', async () => 
     assert.equal(r.settingsChanged, true);
     assert.equal(r.backup, null);
     const s = JSON.parse(read(path.join(paths.claudeHome, 'settings.json')));
-    assert.equal(Object.keys(s.env).length, 5);
+    assert.equal(Object.keys(s.env).length, 6);
   } finally {
     cleanup();
   }
+});
+
+test('dry run previews role files and the delegation block without writing', async () => {
+  const { paths, cleanup } = tempHome();
+  try {
+    write(path.join(paths.claudeHome, 'agents', 'reviewer.md'), '---\nname: reviewer\n---\nmine\n');
+    const r = await installClaude({ paths, port: 4141, dryRun: true, env: {} });
+    assert.equal(r.roles.explorer, 'written');
+    assert.equal(r.roles.reviewer, 'skipped');
+    assert.equal(r.claudeMd, true);
+    assert.equal(fs.existsSync(path.join(paths.claudeHome, 'settings.json')), false);
+    assert.equal(fs.existsSync(path.join(paths.claudeHome, 'agents', 'explorer.md')), false);
+    assert.equal(fs.existsSync(path.join(paths.claudeHome, 'CLAUDE.md')), false);
+  } finally { cleanup(); }
 });

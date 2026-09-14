@@ -75,16 +75,16 @@ export function createServer({ config, keyFor, logFile, log = () => {} }) {
   const server = http.createServer((req, res) => {
     dispatch(req, res).catch((e) => {
       log(`error ${req.method} ${req.url}: ${e.message}`);
-      if (!res.headersSent) sendJson(res, 502, { error: { type: 'server_error', message: `switchboard: ${e.message}` } });
-      else res.destroy();
+      if (res.headersSent) { res.destroy(); return; }
+      if (e.status === 413) sendJson(res, 413, { type: 'error', error: { type: 'invalid_request_error', message: `switchboard: ${e.message}` } }, { connection: 'close' });
+      else sendJson(res, 502, { error: { type: 'server_error', message: `switchboard: ${e.message}` } });
     });
   });
   // Upgrades carry the routing hint but not the body; phase 3 splices GPT sockets through. Declining
   // makes Codex fall back to HTTP for the session (SPEC §7).
   server.on('upgrade', (req, socket) => {
     log(`declined websocket upgrade ${req.url} (${req.headers['x-codex-routing-hint'] ?? 'no hint'})`);
-    socket.write('HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-    socket.destroy();
+    socket.end('HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
   });
   server.stats = ctx.stats;
   server.statusJson = statusJson;

@@ -4,8 +4,11 @@ import { promisify } from 'node:util';
 import { DEFAULT_PORT, loadConfig, saveConfig, listenAddress } from '../config.js';
 import { resolvePaths, codexPresent, claudePresent } from '../paths.js';
 import { setSecret, keychainAvailable } from '../secrets.js';
-import { installClaude, uninstallClaude } from './claude.js';
-import { installCodex, uninstallCodex } from './codex.js';
+import { installClaude, uninstallClaude, readSettings, findConflicts as claudeConflicts, baseUrlFor as claudeUrl } from './claude.js';
+import { installCodex, uninstallCodex, stripManaged, findConflicts as codexConflicts, inlineTablesIn, baseUrlFor as codexUrl } from './codex.js';
+import { readState, readTextOr } from './files.js';
+import path from 'node:path';
+import { parse } from 'smol-toml';
 
 const run = promisify(execFile);
 
@@ -33,6 +36,27 @@ export async function detectClients(paths = resolvePaths(), env = process.env) {
     codex: { present: codex, home: paths.codexHome, ...(codex ? { version: await clientVersion('codex') } : {}) },
     claude: { present: claude, home: paths.claudeHome, ...(claude ? { version: await clientVersion('claude') } : {}) },
   };
+}
+
+/**
+ * Check both clients' configs for anything the installer would refuse, before anything is mutated.
+ * Throws the same messages the installers would, so a Claude-side conflict aborts with Codex untouched.
+ * @param {{ codex: boolean, claude: boolean, port: number, paths: import('../paths.js').Paths }} opts
+ */
+export function preflight({ codex, claude, port, paths }) {
+  if (codex) {
+    const text = readTextOr(path.join(paths.codexHome, 'config.toml'));
+    const clean = stripManaged(text);
+    let parsed = {};
+    try { parsed = clean.trim() ? parse(clean) : {}; } catch (e) { throw new Error(`${path.join(paths.codexHome, 'config.toml')} is not valid TOML (${e.message}); fix it and re-run.`); }
+    const conflicts = codexConflicts(parsed, codexUrl(port), inlineTablesIn(clean));
+    if (conflicts.length) throw new Error(`config.toml has settings the switchboard cannot coexist with: ${conflicts.join(', ')}. Remove them (or move them to a profile you do not use with the switchboard) and re-run.`);
+  }
+  if (claude) {
+    const settings = readSettings(path.join(paths.claudeHome, 'settings.json'));
+    const conflicts = claudeConflicts(settings, claudeUrl(port), readState(paths.stateFile).claude || {});
+    if (conflicts.length) throw new Error(`settings.json has settings the switchboard cannot coexist with: ${conflicts.join(', ')}. Remove them (they would bypass the router or bill an API key instead of your subscription) and re-run.`);
+  }
 }
 
 /**
@@ -65,6 +89,7 @@ export async function runInstall(opts = {}) {
   if (wantCodex) {
     if (!detected.codex.present) report.warnings.push('Codex not detected; configuring anyway.');
     report.codex = await installCodex({ paths, port: report.port, pro: opts.pro, dryRun: opts.dryRun });
+    report.warnings.push(...report.codex.warnings);
   }
   if (wantClaude) {
     if (!detected.claude.present) report.warnings.push('Claude Code not detected; configuring anyway.');

@@ -1,7 +1,7 @@
 // Codex traffic: /backend-api/codex/*  (SPEC §4, §5.1, §6.1, §7)
 import { mergeModels, rewriteEtag } from '../catalog.js';
 import { resolveProvider, stripSuffix } from '../providers.js';
-import { rewriteResponsesRequest, mapUpstreamError, usageFromResponsesEvent, reasoningIdsFromEvent, normalizeResponsesSseData, DEEPSEEK_RESPONSES, OPENROUTER_RESPONSES } from '../adapters/responses.js';
+import { rewriteResponsesRequest, mapUpstreamError, usageFromResponsesEvent, reasoningIdsFromEvent, codexSseMapper, namespacedToolMap, DEEPSEEK_RESPONSES, OPENROUTER_RESPONSES } from '../adapters/responses.js';
 import { readBody, decodeBody, sendJson, upstreamHeaders, upstreamRequest, relayResponse, passThrough, readResponse } from '../proxy.js';
 import { detectExhaustion, liftResponsesLite } from '../failover.js';
 import { createSseRelay } from '../sse.js';
@@ -18,6 +18,7 @@ export function codexRoutes(ctx) {
 
   /** GET /models: proxy upstream, append the provider entries, fork the ETag. */
   async function models(req, res) {
+    if (!requireClientAuth(req, res)) return;
     const url = new URL(req.url, openai);
     const up = await upstreamRequest(url, { method: 'GET', headers: upstreamHeaders(req.headers, url, { 'accept-encoding': 'identity' }) });
     if (up.statusCode !== 200) { relayResponse(up, res); stats.record({ client: 'codex', route: 'models', upstream: 'openai', status: up.statusCode }); return; }
@@ -48,7 +49,7 @@ export function codexRoutes(ctx) {
       return;
     }
     let usage = null;
-    const relay = createSseRelay({ mapData: normalizeResponsesSseData, onEvent: (j) => {
+    const relay = createSseRelay({ mapData: codexSseMapper(namespacedToolMap(body.tools)), onEvent: (j) => {
       for (const id of reasoningIdsFromEvent(j)) provenance.remember(provider.name, id);
       if (j?.type === 'response.completed') usage = usageFromResponsesEvent(j);
     } });
@@ -63,14 +64,15 @@ export function codexRoutes(ctx) {
     const model = modelFromRoutingHint(req.headers['x-codex-routing-hint']);
     const role = req.headers['x-openai-subagent'] ? String(req.headers['x-openai-subagent']) : null;
     const t0 = Date.now();
+    // Every route needs the client's own credential: a provider key must not be spendable by any local process.
+    if (!requireClientAuth(req, res)) return;
     const provider = resolveProvider(providers, model);
+    const badBody = (e) => sendJson(res, 400, { error: { type: 'invalid_request_error', message: `switchboard: cannot read request body: ${e.message}` } });
     if (provider) {
       let body;
-      try { body = parseBody(req, await readBody(req)); }
-      catch (e) { sendJson(res, 400, { error: { type: 'invalid_request_error', message: `switchboard: cannot read request body: ${e.message}` } }); return; }
+      try { body = parseBody(req, await readBody(req)); } catch (e) { return badBody(e); }
       return toProvider(req, res, provider, body, model, role, t0);
     }
-    if (!requireClientAuth(req, res)) return;
     const fallback = failover.enabled ? resolveProvider(providers, failover.model) : null;
     if (!fallback) {
       const up = await passThrough(req, res, openai, `${CODEX_PREFIX}/responses`);
@@ -81,7 +83,8 @@ export function codexRoutes(ctx) {
     const raw = await readBody(req);
     if (failover.state.isActive('codex')) {
       log(`failover active for codex: ${model} → ${failover.model}`);
-      return toProvider(req, res, fallback, parseBody(req, raw), failover.model, role, t0, 'failover');
+      let body; try { body = parseBody(req, raw); } catch (e) { return badBody(e); }
+      return toProvider(req, res, fallback, body, failover.model, role, t0, 'failover');
     }
     const url = new URL(`${CODEX_PREFIX}/responses`, openai);
     const up = await upstreamRequest(url, { method: 'POST', headers: upstreamHeaders(req.headers, url), body: raw });
@@ -89,16 +92,21 @@ export function codexRoutes(ctx) {
       const text = (await readResponse(up)).toString('utf8');
       const verdict = detectExhaustion('codex', up.statusCode, up.headers, text);
       stats.record({ client: 'codex', route: 'responses', model, role, upstream: 'openai', status: 429, ms: Date.now() - t0 });
-      if (!verdict.triggered) { sendJson(res, 429, safeJson(text)); return; }
+      if (!verdict.triggered) {
+        // A transient limit goes back untouched, with the headers Codex reads for its retry and its usage meter.
+        const headers = { 'content-type': up.headers['content-type'] ?? 'application/json' };
+        for (const [k, v] of Object.entries(up.headers)) if (k === 'retry-after' || k.startsWith('x-codex-')) headers[k] = v;
+        res.writeHead(429, headers); res.end(text); return;
+      }
       failover.state.activate('codex', verdict.resetAt, verdict.reason);
       log(`codex usage limit reached (${verdict.reason}); failing over to ${failover.model} until ${verdict.resetAt.toISOString()}`);
-      return toProvider(req, res, fallback, parseBody(req, raw), failover.model, role, t0, 'failover');
+      let body; try { body = parseBody(req, raw); } catch (e) { return badBody(e); }
+      return toProvider(req, res, fallback, body, failover.model, role, t0, 'failover');
     }
     relayResponse(up, res);
     stats.record({ client: 'codex', route: 'responses', model, role, upstream: 'openai', status: up.statusCode, ms: Date.now() - t0 });
   }
 
-  const safeJson = (text) => { try { return JSON.parse(text); } catch { return { error: { type: 'rate_limit_exceeded', message: text.slice(0, 300) } }; } };
 
   /** Everything else under the prefix (usage, compaction, realtime, memories) goes to OpenAI unchanged. */
   async function other(req, res, sub) {

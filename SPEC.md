@@ -137,10 +137,10 @@ The bundled entries (`catalog/deepseek.models.json`) are the ones DeepSeek ships
 
 | Field | deepseek-flash | Why it matters |
 |---|---|---|
-| `shell_type` | `shell_command` | Plain function tools. GPT‑6 Astra uses `unified_exec` and `tool_mode = code_mode_only`; DeepSeek needs neither. |
+| `tool_mode` | unset | No code mode: GPT‑6 Astra uses `tool_mode = code_mode_only` and drives tools through JavaScript; a provider model gets ordinary function calls. (`shell_type` is a deserialisation alias of `unified_exec` in current Codex and makes no difference.) |
 | `apply_patch_tool_type` | `freeform` | DeepSeek's Responses API accepts one custom tool name, `apply_patch`. |
 | `use_responses_lite` | `false` | Tools stay in `tools`, not folded into the input. |
-| `multi_agent_version` | `v2` | Keeps the slug eligible for `spawn_agent`. |
+| `multi_agent_version` | served as `v1` | Eligible for `spawn_agent`; every entry the router serves, injected or upstream, is v1 so no session ever produces encrypted spawn payloads (§10.1). |
 | `supported_reasoning_levels` | low, high, max | Passed through as `reasoning.effort`. |
 | `default_reasoning_summary` | `none` | DeepSeek returns no summaries; the UI does not wait for one. |
 | `context_window` | 1,048,576 at 95% | Matches the API. |
@@ -176,7 +176,7 @@ Request rewrite:
 
 1. `include`: remove `reasoning.encrypted_content`; drop the key if empty.
 2. `input`: delete `encrypted_content` from every `reasoning` item; remove items left empty. Relevant when a child is spawned with `fork_turns` from a GPT parent. Reasoning text that DeepSeek itself returned is never touched: DeepSeek recovers a turn's thinking signature by hashing that exact text, and its own harness replays it on every turn for that reason (docs/research/deepseek-harness-learnings.md).
-3. `tools`: keep `function` and the `apply_patch` custom tool. Flatten `namespace` wrappers into their members. Remove `web_search`, `image_generation`.
+3. `tools`: keep `function` and the `apply_patch` custom tool. Members of a `namespace` wrapper (Codex's collaboration tools, MCP servers) are sent as flat functions named `<namespace>__<name>`, and calls the model makes to them are decoded back into Codex's `namespace` + `name` on the way out, using the exact map built from the request rather than string parsing, since MCP namespaces already contain `__`. History `function_call` items get the same encoding. Remove `web_search`, `image_generation`.
 4. Remove `store`, `prompt_cache_key`, `service_tier`, `safety_identifier`, `text`, `client_metadata`, and each input item's `internal_chat_message_metadata_passthrough`. DeepSeek would ignore them; removing keeps the body identical across requests. Bodies arrive zstd-compressed and are re-sent as plain JSON.
 5. `reasoning.effort`: pass low, high, max; map medium → high, xhigh → max, ultra → max.
 6. Everything else (`instructions`, `input` order, `parallel_tool_calls`, `stream`) untouched.
@@ -195,13 +195,13 @@ Request rewrite:
 4. Content blocks DeepSeek rejects (`document`, `search_result`, `redacted_thinking`) are dropped from `messages` with a log line. Text and tool blocks are never touched.
 5. `context_management`, `tool` beta fields (`strict`, `defer_loading`), `metadata` other than `user_id`: left in place. DeepSeek ignores unknown fields.
 6. Mid-conversation `role: "system"` messages (the `mid-conversation-system` beta) become `role: "user"` messages with the same content, since DeepSeek's endpoint accepts only user and assistant roles in `messages`.
-7. `output_config.format` (structured output, used by Claude Code's session-title call) is removed with a log line; DeepSeek supports only `effort` there. The title may then fail to parse, which Claude Code tolerates.
+7. `output_config.format` (structured output) is removed with a log line; DeepSeek supports only `effort` there. In the installed configuration Claude Code's background traffic (session titles, classifier and helper calls) follows the small-fast and classifier models, which stay on Anthropic; this path is exercised only when DeepSeek is the main model or `ANTHROPIC_DEFAULT_HAIKU_MODEL` is pinned to it.
 
 Response handling:
 
 - SSE forwarded unchanged (`message_start`, `content_block_*`, `message_delta`, `message_stop`, `ping`). On the Responses side, `response.completed.usage` is normalised to the OpenAI spellings (`total_tokens`, `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`) so Codex's context meter and compaction thresholds see the native shape.
 - Ping insurance: Claude Code aborts a stream silent for 300 s. If DeepSeek sends no bytes for 20 s, the switchboard emits `event: ping` itself.
-- Usage normalisation: if the final usage lacks `cache_read_input_tokens` but carries DeepSeek's `prompt_cache_hit_tokens`, the switchboard fills `cache_read_input_tokens` and `cache_creation_input_tokens: 0` so `/usage` shows the prompt-cache line and per-model figures for DeepSeek turns.
+- Usage normalisation: if the final usage lacks `cache_read_input_tokens` but carries DeepSeek's `prompt_cache_hit_tokens`, the switchboard fills `cache_read_input_tokens` and `cache_creation_input_tokens: 0` so `/usage` shows the prompt-cache line and per-model figures for DeepSeek turns. For its own counters the router treats Anthropic's `input_tokens` as the uncached part, so the prompt total is `input + cache_read + cache_creation`, and a `message_delta` that carries only `output_tokens` never zeroes the earlier counts.
 - Error bodies forwarded unmodified. Claude Code matches on upstream error wording to decide its own recovery, and wrapping breaks that.
 
 Thinking blocks across providers: Anthropic rejects thinking blocks it did not sign. When a conversation that ran on DeepSeek returns to Claude (failback, or the user switching models), the switchboard strips assistant `thinking` blocks that carry no signature from Anthropic-bound requests. Claude Code would recover on its own after one rejected request; stripping saves that round trip.
@@ -216,7 +216,7 @@ Both adapters take a profile, so one code path serves every provider and the dif
 | Messages endpoint | `/anthropic/v1/messages` | `/v1/messages` |
 | Effort ladder | `low, high, max` | `minimal, low, medium, high` |
 | Custom tools kept | `apply_patch` | none (function tools only) |
-| Encrypted reasoning sent back | never | only for items OpenRouter itself produced, tracked by id in a bounded in-memory provenance set, so a fork from a GPT parent never forwards OpenAI's encrypted items and an OpenRouter-main session keeps its own chains |
+| Encrypted reasoning sent back | never | only for items OpenRouter itself produced, tracked by id in a bounded in-memory LRU (a hit refreshes the id), so a fork from a GPT parent never forwards OpenAI's encrypted items and an OpenRouter-main session keeps its own chains. A router restart forgets the set, which costs one prefix rebuild per live OpenRouter conversation |
 | `thinking: adaptive` | rewritten to `enabled` | passed through (OpenRouter forwards it to Anthropic-hosted models) |
 | `output_config.format` | dropped | kept |
 | Mid-conversation `system` messages | converted to `user` | converted to `user` |
@@ -282,6 +282,8 @@ Both clients already send cache-shaped requests: a fixed system prompt or `instr
 
 These rules are the ones DeepSeek applies in its own harness, where every model-visible addition must document its "KV cache effect" and anything volatile goes into a tail message that is re-emitted only when it changes. The reference notes are in `docs/research/deepseek-harness-learnings.md`.
 
+Under the forced-v1 models list, GPT‑6 Astra's `ultra` effort is effort-only for the parent: its automatic task delegation is a v2 behaviour, so delegation rests on the policy block in §10.3, which is the intended design.
+
 Cache hygiene the installer applies only if the keys are absent: keep default compaction thresholds; for Claude Code leave `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` unset (the extra fields are ignored by DeepSeek and needed by Claude); for Codex leave `context_management.experimental_mode` at its current value but warn if it is on, since it rewrites history more often.
 
 ## 10. Client configuration
@@ -315,24 +317,22 @@ Role files in `~/.codex/agents/`, named after the built-in roles so they replace
 ```toml
 # explorer.toml
 name = "explorer"
-description = "Fast, read-only codebase exploration on DeepSeek Flash: find files, trace call paths, summarise modules, answer questions about existing code."
+description = "Fast, read-only codebase exploration on DeepSeek Flash: find files, trace call paths, summarise modules, answer questions about existing code. Several explorers can run in parallel on independent questions."
 model = "deepseek-flash"
 model_reasoning_effort = "low"
-sandbox_mode = "read-only"
 developer_instructions = """
-You are an explorer. Answer the parent's question about the codebase with file paths and line references. Do not modify files. Do not speculate beyond what you read. Be brief.
+You are an explorer. Answer the parent's question about the codebase with file paths and line references. Read as much as you need; report only what the parent needs: a direct answer first, then the evidence, at most a screenful. Do not modify files. Do not speculate beyond what you read. Other explorers may be answering other questions in parallel; stay on yours.
 """
 ```
 
 ```toml
 # worker.toml
 name = "worker"
-description = "Implementation on DeepSeek Flash for bounded, fully specified changes: a function, a test, a migration, a refactor within one module."
+description = "Implementation on DeepSeek Flash for bounded, fully specified changes: a function, a test, a migration, a refactor within one module. Assign it ownership of specific files; other agents may edit the same tree in parallel, so it never reverts or reformats code it did not write, and it reports the files it touched."
 model = "deepseek-flash"
 model_reasoning_effort = "high"
-sandbox_mode = "workspace-write"
 developer_instructions = """
-You are a worker. Implement exactly the task the parent specified, run the relevant tests, and report the diff summary and test output. If the task is under-specified or you are blocked, stop and say what you need instead of guessing.
+You are a worker. Implement exactly the task the parent specified, run the relevant tests, and report a short diff summary, the files you touched and the test result, at most a screenful; include failing output verbatim only for the failures. You own only the files the parent assigned to you. Other agents may be editing the same tree in parallel: never revert, reformat or clean up code you did not write, even if it looks wrong. If the task is under-specified or you are blocked, stop and say what you need instead of guessing.
 """
 ```
 
@@ -342,9 +342,8 @@ name = "reviewer"
 description = "Independent review on DeepSeek Flash: check a diff for bugs, missing tests and spec mismatches before the parent accepts it."
 model = "deepseek-flash"
 model_reasoning_effort = "high"
-sandbox_mode = "read-only"
 developer_instructions = """
-You are a reviewer. Read the diff and the surrounding code. Report concrete defects with file and line, ranked by severity. Do not restate the diff. Say clearly when you find nothing.
+You are a reviewer. Read the diff and the surrounding code, run the tests if they exist. Report concrete defects with file and line, ranked by severity, each with a one-line fix suggestion. Do not restate the diff. Say clearly when you find nothing.
 """
 ```
 
@@ -354,13 +353,14 @@ name = "senior"
 description = "Escalation on a frontier GPT model. Use only after a Flash worker failed twice, or for cross-module design work."
 model = "gpt-5.5"
 model_reasoning_effort = "high"
-sandbox_mode = "workspace-write"
 developer_instructions = """
-You are the senior engineer. You receive tasks a faster model could not complete. Read the previous attempt's report first, then solve the task end to end.
+You are the senior engineer. You receive tasks a faster model could not complete. The failed attempt's report should be in your brief; if it is missing, say what you need instead of repeating work that already failed. Solve the task end to end and run the tests. Report what you changed, the files you touched, how you verified it, and what remains, at most a screenful.
 """
 ```
 
 `senior` needs an explicit model because `default_subagent_model` is applied before the role file. `switchboard roles --pro` moves `reviewer` and `senior` to `deepseek-v4-pro` for an all-DeepSeek fleet.
+
+Codex applies a fixed whitelist of role fields (model, reasoning effort and summary, verbosity, personality, service tier, feature-disables, skills). A role file cannot restrict a child's sandbox, so the files carry no `sandbox_mode`: read-only behaviour rests on the `developer_instructions`, and Codex's own explorer role is read-only by convention only. The worker and explorer texts carry the coordination rules Codex's built-in role descriptions had: a worker owns the files it is assigned, never reverts or reformats code it did not write, and reports the files it touched; explorers run in parallel on independent questions.
 
 ### 10.2 Claude Code: `~/.claude/settings.json`
 
@@ -371,26 +371,28 @@ You are the senior engineer. You receive tasks a faster model could not complete
     "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-flash[1m]",
     "ANTHROPIC_CUSTOM_MODEL_OPTION": "deepseek-flash[1m]",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "DeepSeek Flash",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "DeepSeek V4.1 Flash · 1M context · via switchboard"
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "DeepSeek V4.1 Flash · 1M context · via switchboard",
+    "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT": "1"
   },
   "modelSettings": {
-    "deepseek-flash": { "effort": "high" }
+    "deepseek-flash": { "effortLevel": "high" }
   }
 }
 ```
 
-The `[1m]` suffix tells Claude Code the real context window; without it an unrecognised id is assumed to have 200K and auto-compaction fires early. The router strips the suffix before DeepSeek sees it. Existing keys are merged, not replaced. The desktop app, the CLI and the IDE extensions all read this file.
+The `[1m]` suffix tells Claude Code the real context window; without it an unrecognised id is assumed to have 200K and auto-compaction fires early. The router strips the suffix before DeepSeek sees it. `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT` makes Claude Code send `output_config.effort` for a model id it does not recognise, so the session's effort level and ultracode's `xhigh` reach DeepSeek (the adapter maps them onto `low | high | max`). The `modelSettings` field is `effortLevel`, merged into any entry the user already has for that id, so a level saved with `/effort` is restored on uninstall. Existing keys are merged, not replaced. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` is detected and warned about, not set: it would collapse every role, including `senior`'s `inherit`, onto the subagent model, and the Explore/Plan files already cover the built-ins. The desktop app, the CLI and the IDE extensions all read this file.
 
 Role files in `~/.claude/agents/`:
 
 ```markdown
 ---
 name: explorer
-description: Fast, read-only codebase exploration on DeepSeek Flash. Use for finding files, tracing call paths, summarising modules, answering questions about existing code.
+description: Fast, read-only codebase exploration on DeepSeek Flash. Use for finding files, tracing call paths, summarising modules, answering questions about existing code. Several explorers can run in parallel on independent questions.
 model: deepseek-flash[1m]
 tools: Read, Grep, Glob, Bash
+effort: low
 ---
-You are an explorer. Answer the parent's question about the codebase with file paths and line references. Do not modify files. Do not speculate beyond what you read. Be brief.
+You are an explorer. Answer the parent's question about the codebase with file paths and line references. Read as much as you need; report only what the parent needs: a direct answer first, then the evidence, at most a screenful. Do not modify files. Do not speculate beyond what you read. Other explorers may be answering other questions in parallel; stay on yours.
 ```
 
 `worker` (model `deepseek-flash[1m]`, all tools, `effort: high`), `reviewer` (read-only tools, `effort: high`) and `senior` (model `inherit`, so it runs on whatever frontier model the session uses) follow the same pattern with the instructions from §10.1. Claude Code's built-in `Explore` and `Plan` agents do not follow `CLAUDE_CODE_SUBAGENT_MODEL`: they inherit the main model. A user agent with the same name replaces the built-in and keeps its own model, so the installer also writes `Explore.md` (`effort: low`) and `Plan.md` (`effort: high`) on Flash. Claude reaches for Explore on its own many times per session, which makes this the largest single saving on the Claude side. The frontmatter `effort` flows through the Messages adapter onto DeepSeek's `low | high | max` ladder.
@@ -406,8 +408,10 @@ The same marked block is appended to `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.
 Subagents run on DeepSeek Flash: 1M context, roughly 50x cheaper than this session, and their context never enters yours. Every file you read, test you run, or log you scan in this session spends the expensive budget; done in a subagent it costs cents and returns a summary. Delegate by default, keep judgement here.
 
 - explorer: anything that means reading before deciding: where is X, how does Y work, what does this test output mean, what changed in this diff. Give one precise question per explorer and spawn several in parallel. Trust their file:line references; verify only what you change.
-- worker: implementation that fits in one message: exact files, exact behaviour, how to verify. It runs the tests and reports the diff summary and results. Split larger work into worker-sized pieces first.
-- reviewer: every non-trivial diff before you accept it, and before you tell the user it is done.
+- Keep the critical path here: if your very next action is blocked on the answer, read it yourself, then delegate the sidecar reading that can run while you work. Send a blocking question to Flash only when the answer replaces a large amount of reading you would otherwise do yourself.
+- Reuse before you respawn: for a related question about code an explorer or worker already read, continue that agent (Codex send_input or followup_task, Claude Code resuming the subagent) instead of spawning a new one; its context is already paid for. Respawn only when the question needs a clean read.
+- worker: implementation that fits in one message: exact files, exact behaviour, how to verify. Give it ownership of specific files; it runs the tests and reports the diff summary, the files it touched and the results. Split larger work into worker-sized pieces first.
+- reviewer: every non-trivial diff before you accept it, and before you tell the user it is done. Give it the base ref or commit to diff against and what "done" means; it starts with no history of this session.
 - senior: only after a worker failed twice on the same task, or for a decision that spans modules. Pass the failed attempt's report so it does not start from zero.
 
 Brief each subagent with the goal, the exact files or commands, and the shape of answer you want. Ask for at most a screenful back. Never paste large outputs into this session; ask an explorer to summarise them.
@@ -422,7 +426,7 @@ Do not delegate: choosing an approach, resolving ambiguity with the user, anythi
 
 | Command | Effect |
 |---|---|
-| `install [--codex] [--claude] [--port N]` | Detects installed clients (default: both present ones). Asks for the DeepSeek key once and stores it in the keychain. Probes DeepSeek on both dialects. Backs up and edits each client's config, writes role files and the delegation block, registers the login service, starts it, runs `doctor`. Idempotent. |
+| `install [--codex] [--claude] [--port N] [--pro] [--openrouter-key K] [--dry-run]` | Detects installed clients (default: both present ones). Asks for the DeepSeek key once (and optionally an OpenRouter key) and stores them in the keychain. Probes each provider on both dialects. Pre-flights both clients' configs and stops with nothing changed on a conflict or a corrupt file. Registers and starts the login service, waits for `/switchboard/health`, completes a real turn per client through the router using only an override, and only then backs up and edits each client's config, writes role files and the delegation block, and runs `doctor`. Exit code reflects the install; failed connectivity probes are reported but do not fail it. `--dry-run` previews config, role-file and delegation-block outcomes without writing. Idempotent. |
 | `doctor` | Service running; port bound; each client's base URL correct; subscription auth present per client; upstreams reachable; DeepSeek key valid on both dialects; Codex `/models` served with DeepSeek entries; client versions within the supported ranges. Exit code reflects health. |
 | `test` | Codex: `codex exec` spawns an explorer; verifies from the switchboard log that a `deepseek-flash` request reached DeepSeek and from `~/.codex/state_*.sqlite` that the child recorded `model = deepseek-flash`. Claude Code: `claude -p` runs a prompt that invokes the explorer subagent; verifies a request with `x-claude-code-agent-id` and model `deepseek-flash` reached DeepSeek. Prints the evidence. |
 | `status` | Routes, failover state per client, per-model tokens, cache hit ratio per role, estimated spend today. |
@@ -430,11 +434,11 @@ Do not delegate: choosing an approach, resolving ambiguity with the user, anythi
 | `roles [--pro] [--reset]` | Rewrites role files for both clients. |
 | `failover on\|off\|reset` | Toggles or clears failover state. |
 | `serve` | Runs the router in the foreground. What the service runs. |
-| `uninstall [--purge]` | Stops and removes the service, restores each client's config from the backup it made, removes role files and delegation blocks. `--purge` also deletes the keychain entry. |
+| `uninstall [--purge]` | Restores each client's config (a config the installer never marked is left byte-identical), removes role files and delegation blocks, then stops and removes the service. `--purge` also deletes every provider's keychain entry and the switchboard home. |
 
 Login service: `launchd` user agent on macOS (`~/Library/LaunchAgents/dev.agents-switchboard.plist`), `systemd --user` unit on Linux, Scheduled Task at logon on Windows. `KeepAlive`, logs to `~/.agents-switchboard/switchboard.log` with size rotation.
 
-Secrets: macOS Keychain via `security`, Linux Secret Service via `secret-tool` when present, Windows Credential Manager via `cmdkey`. Without a keychain, the installer falls back to an env var in the service definition and says so. The key never appears in client config, role files, logs, or `test` output.
+Secrets: macOS Keychain via `security`, Linux Secret Service via `secret-tool` when present, Windows PasswordVault via PowerShell. Without a keychain, the installer writes `api_key = { env = "DEEPSEEK_API_KEY" }` (or the OpenRouter equivalent) into the switchboard config and puts the key into the service definition's environment: the plist's `EnvironmentVariables`, the unit's `Environment=`, or on Windows a user-only `service.env.cmd` sourced by the task's wrapper. The definition files are user-only. The key never appears in client config, role files, logs, `install` output, or `test` output.
 
 Switchboard config, `~/.agents-switchboard/config.toml`:
 
@@ -480,7 +484,7 @@ model = "deepseek-flash"
 ## 13. Security and privacy
 
 - Binds to `127.0.0.1` only. Any other address requires `--allow-remote`, which the installer never sets.
-- Requests without `Authorization` or `x-api-key` on a pass-through route are rejected, so a stray local process cannot reach ChatGPT or Anthropic anonymously through the router. Tokens are not validated locally; the upstream does that.
+- Every route, pass-through or provider, requires the client's own `Authorization` or `x-api-key` header, so a stray local process can neither reach ChatGPT or Anthropic anonymously through the router nor spend the stored DeepSeek or OpenRouter key. Tokens are not validated locally; the upstream does that. Bodies above 32 MB are answered with 413. A client that disconnects mid-stream takes the vendor connection down with it.
 - The ChatGPT token goes only to `chatgpt.com`, the Anthropic OAuth token only to `api.anthropic.com`, the DeepSeek key only to `api.deepseek.com`. Hosts are pinned in code and overridable only in the switchboard's own config file, created with user-only permissions.
 - Bodies are streamed, never stored. Logs hold metadata only.
 - The router never answers a client with HTTP 401. Both clients treat a 401 from their backend as an expired login and start a token refresh; observed with Codex, which reported a revoked refresh token after a single 401 from the router. A missing or rejected DeepSeek key is reported as a 400 with an explanatory message.

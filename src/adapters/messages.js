@@ -121,10 +121,22 @@ export function normalizeSseData(data) {
 }
 
 /** Token counts (and OpenRouter's `cost`) from a `message_delta` / `message_start` payload. */
+/**
+ * Token counts from a `message_start` / `message_delta` payload. Only fields present in the event are
+ * returned, so a `message_delta` that carries just `output_tokens` never zeroes the earlier counts.
+ * Anthropic's `input_tokens` excludes cached tokens, so the reported input is the full prompt:
+ * input + cache_read + cache_creation, with `cached` = cache reads.
+ */
 export function usageFromMessagesEvent(j) {
   const u = j?.usage ?? j?.message?.usage;
   if (!u) return null;
-  const usage = { input: u.input_tokens ?? 0, cached: u.cache_read_input_tokens ?? u.prompt_cache_hit_tokens ?? 0, output: u.output_tokens ?? 0 };
+  const usage = {};
+  const cacheRead = u.cache_read_input_tokens ?? u.prompt_cache_hit_tokens;
+  if (u.input_tokens != null || cacheRead != null) {
+    usage.input = (u.input_tokens ?? 0) + (cacheRead ?? 0) + (u.cache_creation_input_tokens ?? 0);
+    usage.cached = cacheRead ?? 0;
+  }
+  if (u.output_tokens != null) usage.output = u.output_tokens;
   if (typeof u.cost === 'number') usage.usd = u.cost;
-  return usage;
+  return Object.keys(usage).length ? usage : null;
 }

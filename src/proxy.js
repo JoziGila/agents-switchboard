@@ -5,13 +5,41 @@ import zlib from 'node:zlib';
 const HOP_BY_HOP = new Set(['host', 'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer']);
 
 /** Collect a request body into a Buffer. */
-export function readBody(req) {
+export const MAX_BODY_BYTES = 32 * 1024 * 1024;
+
+/** Collect a request body into a Buffer; rejects with `{ status: 413 }` past MAX_BODY_BYTES. */
+export function readBody(req, limit = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    let size = 0, rejected = false;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) {
+        // Drain instead of destroying, so the 413 reaches the client rather than a connection reset.
+        if (!rejected) { rejected = true; const e = new Error(`request body exceeds ${limit} bytes`); e.status = 413; reject(e); }
+        chunks.length = 0; return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+/** Header names listed in a `Connection` header are hop-by-hop too. */
+function connectionTokens(headers) {
+  return String(headers.connection ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+}
+
+function decoderFor(encoding) {
+  switch ((encoding ?? '').trim().toLowerCase()) {
+    case '': case 'identity': return null;
+    case 'gzip': return zlib.createGunzip();
+    case 'br': return zlib.createBrotliDecompress();
+    case 'deflate': return zlib.createInflate();
+    case 'zstd': return zlib.createZstdDecompress();
+    default: return null;
+  }
 }
 
 /** Decode a request body according to its Content-Encoding. */
@@ -37,7 +65,8 @@ function client(url) { return url.protocol === 'https:' ? https : http; }
 /** Copy request headers for the upstream, dropping hop-by-hop ones and rewriting host. */
 export function upstreamHeaders(headers, url, overrides = {}) {
   const out = {};
-  for (const [k, v] of Object.entries(headers)) if (!HOP_BY_HOP.has(k)) out[k] = v;
+  const extraHop = connectionTokens(headers);
+  for (const [k, v] of Object.entries(headers)) if (!HOP_BY_HOP.has(k) && !extraHop.includes(k)) out[k] = v;
   out.host = url.host;
   for (const [k, v] of Object.entries(overrides)) { if (v == null) delete out[k]; else out[k] = v; }
   return out;
@@ -61,11 +90,19 @@ export function upstreamRequest(url, { method, headers, body, timeoutMs = 600_00
 /** Relay an upstream response (status, headers, bytes) to the client unchanged. */
 export function relayResponse(up, res, { transform } = {}) {
   const headers = {};
-  for (const [k, v] of Object.entries(up.headers)) if (!HOP_BY_HOP.has(k)) headers[k] = v;
+  const extraHop = connectionTokens(up.headers);
+  for (const [k, v] of Object.entries(up.headers)) if (!HOP_BY_HOP.has(k) && !extraHop.includes(k)) headers[k] = v;
   if (transform) { delete headers['content-length']; delete headers['content-encoding']; }
   res.writeHead(up.statusCode, headers);
-  if (transform) up.pipe(transform).pipe(res); else up.pipe(res);
+  if (transform) {
+    // The router asks providers for identity encoding; if one compresses anyway, decode before the line transform.
+    const decoder = decoderFor(up.headers['content-encoding']);
+    (decoder ? up.pipe(decoder) : up).pipe(transform).pipe(res);
+    transform.on('error', () => res.destroy());
+  } else up.pipe(res);
   up.on('error', () => res.destroy());
+  // A client that goes away must not keep the vendor connection (and its billing) alive.
+  res.on('close', () => { if (!up.complete) up.destroy(); if (transform && !transform.destroyed) transform.destroy(); });
 }
 
 /** Byte-for-byte reverse proxy of `req` to `baseUrl + path`. */

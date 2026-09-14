@@ -71,8 +71,8 @@ const roleFilesExist = (dir, extension, names = ROLE_NAMES) => names.every((name
  */
 const providerChecks = (c) => c.providers.flatMap(({ provider, key }) => [
   { name: `${provider.name} key present`, run: () => ({ ok: provider.name !== 'deepseek' || !!key, detail: key ? 'keychain/env' : provider.name === 'deepseek' ? 'run `switchboard install` with a key' : 'optional; add with `switchboard install --openrouter-key …`' }) },
-  { name: `${provider.name} responses API`, when: () => key && !c.opts.offline, run: async () => { c.probes ??= {}; c.probes[provider.name] = await probeProvider(provider, key); return { ok: c.probes[provider.name].responses.ok, detail: c.probes[provider.name].responses.error ?? '' }; } },
-  { name: `${provider.name} messages API`, when: () => key && !c.opts.offline, run: () => ({ ok: c.probes[provider.name].messages.ok, detail: c.probes[provider.name].messages.error ?? '' }) },
+  { name: `${provider.name} responses API`, connectivity: true, when: () => key && !c.opts.offline, run: async () => { c.probes ??= {}; c.probes[provider.name] = await probeProvider(provider, key); return { ok: c.probes[provider.name].responses.ok, detail: c.probes[provider.name].responses.error ?? '' }; } },
+  { name: `${provider.name} messages API`, connectivity: true, when: () => key && !c.opts.offline, run: () => ({ ok: c.probes[provider.name].messages.ok, detail: c.probes[provider.name].messages.error ?? '' }) },
 ]);
 
 const CHECKS = [
@@ -98,17 +98,19 @@ const CHECKS = [
   { name: 'claude version in range', when: (c) => c.detected.claude.present, run: (c) => ({ ok: !c.detected.claude.version || semverGte(c.detected.claude.version, MIN_CLAUDE), detail: `${c.detected.claude.version ?? 'unknown'} (supported ${c.pkg.switchboard.claudeRange})` }) },
   { name: 'claude ANTHROPIC_BASE_URL points at router', when: (c) => c.detected.claude.present, run: (c) => c.claudeSettings.env?.ANTHROPIC_BASE_URL === claudeUrl(c.port) },
   { name: 'claude subagent model set', when: (c) => c.detected.claude.present, run: (c) => /^deepseek-/.test(c.claudeSettings.env?.CLAUDE_CODE_SUBAGENT_MODEL ?? '') },
+  { name: 'claude sends effort for the DeepSeek id (CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)', when: (c) => c.detected.claude.present, run: (c) => c.claudeSettings.env?.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT === '1' },
   { name: 'claude has no API-key credential (subscription stays active)', when: (c) => c.detected.claude.present, run: (c) => !c.claudeSettings.env?.ANTHROPIC_API_KEY && !c.claudeSettings.env?.ANTHROPIC_AUTH_TOKEN && !c.claudeSettings.apiKeyHelper && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN },
   { name: 'claude role files', when: (c) => c.detected.claude.present, run: (c) => roleFilesExist(path.join(c.paths.claudeHome, 'agents'), '.md', CLAUDE_ROLE_NAMES) },
 
-  { name: 'chatgpt.com reachable', when: (c) => !c.opts.offline, run: (c) => reachable(c.cfg.upstream.openai.base_url, REACH_TIMEOUT_MS) },
-  { name: 'api.anthropic.com reachable', when: (c) => !c.opts.offline, run: (c) => reachable(c.cfg.upstream.anthropic.base_url, REACH_TIMEOUT_MS) },
+  { name: 'chatgpt.com reachable', connectivity: true, when: (c) => !c.opts.offline, run: (c) => reachable(c.cfg.upstream.openai.base_url, REACH_TIMEOUT_MS) },
+  { name: 'api.anthropic.com reachable', connectivity: true, when: (c) => !c.opts.offline, run: (c) => reachable(c.cfg.upstream.anthropic.base_url, REACH_TIMEOUT_MS) },
 ];
 
 /**
  * Run every applicable check. Prints one line per check (all of them, or only when something failed with `quiet`).
- * @param {{ offline?: boolean, quiet?: boolean }} [opts]
- * @returns {Promise<number>} exit code: 0 when all checks pass
+ * Checks tagged `connectivity` probe the network; callers that only care about the install can ignore those.
+ * @param {{ offline?: boolean, quiet?: boolean, report?: boolean }} [opts]  `report` returns the results instead of an exit code
+ * @returns {Promise<number|{ results: object[], failed: object[] }>} exit code 0 when all checks pass, or the report
  */
 export async function doctor(opts = {}) {
   const ctx = await gatherContext(opts);
@@ -117,12 +119,13 @@ export async function doctor(opts = {}) {
     if (check.when && !check.when(ctx)) continue;
     const outcome = await check.run(ctx);
     const { ok, detail = '' } = typeof outcome === 'object' ? outcome : { ok: outcome };
-    results.push({ name: typeof check.name === 'function' ? check.name(ctx) : check.name, ok, detail });
+    results.push({ name: typeof check.name === 'function' ? check.name(ctx) : check.name, ok, detail, connectivity: !!check.connectivity });
   }
   const failed = results.filter((r) => !r.ok);
   if (!opts.quiet || failed.length) {
     for (const r of results) process.stdout.write(`${r.ok ? '✓' : '✗'} ${r.name}${r.detail ? `  — ${r.detail}` : ''}\n`);
   }
   process.stdout.write(failed.length ? `\n${failed.length} check(s) failed\n` : 'all checks passed\n');
+  if (opts.report) return { results, failed };
   return failed.length ? 1 : 0;
 }

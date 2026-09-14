@@ -49,7 +49,7 @@ export function createStats({ logFile } = {}) {
     if (stream) stream.write(JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
   }
   function snapshot() {
-    const withRatio = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, { ...v, cacheHitRatio: v.input ? +(v.cached / v.input).toFixed(3) : null }]));
+    const withRatio = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, { ...v, cacheHitRatio: v.input ? +Math.min(1, v.cached / v.input).toFixed(3) : null }]));
     return { uptimeSec: Math.round((Date.now() - startedAt) / 1000), peakNow: isPeak(), models: withRatio(models), roles: withRatio(roles), upstreams };
   }
   return { record, snapshot };

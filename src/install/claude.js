@@ -3,14 +3,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DEFAULT_PORT } from '../config.js';
 import { resolvePaths } from '../paths.js';
-import { backupFile, readTextOr, readState, writeState, writeRoleFiles, removeRoleFiles, upsertDelegationFile, removeDelegationFile } from './files.js';
-import { claudeRoles, renderClaudeRole, MANAGED_MD, CLAUDE_ROLE_NAMES } from './roles.js';
+import { backupFile, readTextOr, readState, writeState, writeRoleFiles, removeRoleFiles, previewRoles, upsertDelegationFile, removeDelegationFile } from './files.js';
+import { claudeRoles, renderClaudeRole, MANAGED_MD, CLAUDE_ROLE_NAMES, upsertDelegation } from './roles.js';
 
-/** The `modelSettings` entry the installer owns. */
+/** The `modelSettings` field the installer owns; merged into the model's entry, never replacing it. */
 const MODEL_SETTINGS_KEY = 'deepseek-flash';
-const MODEL_SETTINGS_VALUE = Object.freeze({ effort: 'high' });
+const MODEL_SETTINGS_FIELD = 'effortLevel';
+const MODEL_SETTINGS_VALUE = 'high';
 /** Credential-bearing env vars that would switch billing off the subscription (SPEC §10). */
 const CREDENTIAL_ENV = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'];
+/** Forces every subagent, including senior's `inherit`, onto the subagent model; the Explore/Plan files are the intended mechanism instead. */
+const FORCE_ENV = 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE';
+/** `http://127.0.0.1:<port>/anthropic` is ours whatever the port, even when state.json was lost. */
+const OUR_URL_SHAPE = /^http:\/\/127\.0\.0\.1:\d+\/anthropic\/?$/;
 
 /**
  * The `ANTHROPIC_BASE_URL` for the switchboard's Anthropic-format prefix.
@@ -33,7 +38,26 @@ export function managedEnv(port) {
     ANTHROPIC_CUSTOM_MODEL_OPTION: 'deepseek-flash[1m]',
     ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: 'DeepSeek Flash',
     ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION: 'DeepSeek V4.1 Flash · 1M context · via switchboard',
+    // Claude Code only sends output_config.effort for models it recognises; this makes it send it for the DeepSeek id too.
+    CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: '1',
   };
+}
+
+/**
+ * Settings that do not block the install but change what the role files can do (SPEC §10.2).
+ * @param {object} settings parsed settings.json
+ * @param {NodeJS.ProcessEnv} [processEnv]
+ * @returns {string[]}
+ */
+export function findWarnings(settings, processEnv = {}) {
+  const warnings = [];
+  for (const key of CREDENTIAL_ENV) {
+    if (processEnv[key]) warnings.push(`${key} is set in your shell environment; it overrides the subscription login and bypasses the switchboard for sessions started from that shell.`);
+  }
+  if (settings.env?.[FORCE_ENV] || processEnv[FORCE_ENV]) {
+    warnings.push(`${FORCE_ENV} is set; it collapses every subagent, including senior's model: inherit, onto CLAUDE_CODE_SUBAGENT_MODEL. The Explore and Plan agent files already put Claude's built-in agents on DeepSeek, so unset it unless you want no frontier escalation.`);
+  }
+  return warnings;
 }
 
 /**
@@ -48,7 +72,7 @@ export function findConflicts(settings, ourUrl, state = {}) {
   const conflicts = [];
   for (const key of CREDENTIAL_ENV) if (env[key] !== undefined) conflicts.push(`env.${key}`);
   if (settings.apiKeyHelper !== undefined) conflicts.push('apiKeyHelper');
-  const weOwnUrl = state.env?.ANTHROPIC_BASE_URL !== undefined;
+  const weOwnUrl = state.env?.ANTHROPIC_BASE_URL !== undefined || OUR_URL_SHAPE.test(String(env.ANTHROPIC_BASE_URL ?? ''));
   if (env.ANTHROPIC_BASE_URL !== undefined && env.ANTHROPIC_BASE_URL !== ourUrl && !weOwnUrl) {
     conflicts.push(`env.ANTHROPIC_BASE_URL = "${env.ANTHROPIC_BASE_URL}"`);
   }
@@ -78,8 +102,11 @@ export function applyClaudeSettings(settings, port, prevState = {}) {
     next.env[key] = value;
   }
   next.modelSettings = { ...(next.modelSettings || {}) };
-  if (state.modelSettings === undefined) state.modelSettings = settings.modelSettings?.[MODEL_SETTINGS_KEY] ?? null;
-  next.modelSettings[MODEL_SETTINGS_KEY] = { ...MODEL_SETTINGS_VALUE };
+  // Record the previous value of just our field, so a level the user saved with /effort or other fields survive.
+  if (state.modelSettings === undefined) state.modelSettings = settings.modelSettings?.[MODEL_SETTINGS_KEY]?.[MODEL_SETTINGS_FIELD] ?? null;
+  // `effort` was the key an earlier switchboard release wrote; Claude Code reads `effortLevel`.
+  const { effort: legacy, ...current } = next.modelSettings[MODEL_SETTINGS_KEY] || {};
+  next.modelSettings[MODEL_SETTINGS_KEY] = { ...current, ...(legacy !== undefined && legacy !== MODEL_SETTINGS_VALUE ? { effort: legacy } : {}), [MODEL_SETTINGS_FIELD]: MODEL_SETTINGS_VALUE };
   return { settings: next, state };
 }
 
@@ -97,9 +124,12 @@ export function revertClaudeSettings(settings, state = {}) {
     }
     if (!Object.keys(next.env).length) delete next.env;
   }
-  if (next.modelSettings && state.modelSettings !== undefined) {
-    if (state.modelSettings === null) delete next.modelSettings[MODEL_SETTINGS_KEY];
-    else next.modelSettings[MODEL_SETTINGS_KEY] = state.modelSettings;
+  if (next.modelSettings?.[MODEL_SETTINGS_KEY] && state.modelSettings !== undefined) {
+    const entry = { ...next.modelSettings[MODEL_SETTINGS_KEY] };
+    if (state.modelSettings === null) delete entry[MODEL_SETTINGS_FIELD];
+    else entry[MODEL_SETTINGS_FIELD] = state.modelSettings;
+    if (Object.keys(entry).length) next.modelSettings[MODEL_SETTINGS_KEY] = entry;
+    else delete next.modelSettings[MODEL_SETTINGS_KEY];
     if (!Object.keys(next.modelSettings).length) delete next.modelSettings;
   }
   return next;
@@ -107,9 +137,29 @@ export function revertClaudeSettings(settings, state = {}) {
 
 const renderSettings = (settings) => JSON.stringify(settings, null, 2) + '\n';
 
-function readSettings(file) {
+/**
+ * Parse settings.json, reporting a corrupt file by name instead of a raw SyntaxError.
+ * @param {string} file
+ * @returns {object}
+ */
+export function readSettings(file) {
   const text = readTextOr(file);
-  return text.trim() ? JSON.parse(text) : {};
+  if (!text.trim()) return {};
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(`${file} is not valid JSON (${e.message}); fix it and re-run.`);
+  }
+}
+
+/**
+ * Role-file and delegation-block outcomes computed without writing (for --dry-run).
+ * @param {import('./files.js').RoleFileSpec & { names: string[] }} spec
+ * @param {string} instructionsFile
+ * @returns {{ roles: Record<string, 'written'|'unchanged'|'skipped'>, block: boolean }}
+ */
+export function previewRoleFiles(spec, instructionsFile) {
+  return { roles: previewRoles(spec), block: upsertDelegation(readTextOr(instructionsFile)) !== readTextOr(instructionsFile) };
 }
 
 const roleSpec = (claudeHome, pro) => ({
@@ -131,11 +181,11 @@ export async function installClaude(opts = {}) {
   const allState = readState(paths.stateFile);
   const { settings: next, state } = applyClaudeSettings(readSettings(settingsFile), port, allState.claude || {});
   const nextText = renderSettings(next);
-  const report = { settingsFile, settingsChanged: nextText !== readTextOr(settingsFile), backup: null, roles: {}, claudeMd: false, warnings: [], dryRun: !!opts.dryRun };
-  for (const key of CREDENTIAL_ENV) {
-    if (processEnv[key]) report.warnings.push(`${key} is set in your shell environment; it overrides the subscription login and bypasses the switchboard for sessions started from that shell.`);
+  const report = { settingsFile, settingsChanged: nextText !== readTextOr(settingsFile), backup: null, roles: {}, claudeMd: false, warnings: findWarnings(readSettings(settingsFile), processEnv), dryRun: !!opts.dryRun };
+  if (opts.dryRun) {
+    const preview = previewRoleFiles(roleSpec(claudeHome, opts.pro), path.join(claudeHome, 'CLAUDE.md'));
+    return { ...report, roles: preview.roles, claudeMd: preview.block };
   }
-  if (opts.dryRun) return report;
 
   if (report.settingsChanged) {
     report.backup = backupFile(settingsFile, paths.backupsDir, 'claude-settings.json');

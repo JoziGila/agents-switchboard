@@ -16,12 +16,18 @@ const xml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, 
 /** Swallow the error from a command whose failure means "already in the desired state". */
 const ignoreFailure = () => {};
 
+/** `<key>NAME</key><string>VALUE</string>` lines for a plist EnvironmentVariables dict. */
+const plistEnv = (env) => Object.entries(env).map(([k, v]) => `    <key>${xml(k)}</key><string>${xml(v)}</string>`).join('\n');
+/** `Environment=NAME=VALUE` lines for a systemd unit, quoted so spaces and quotes survive. */
+const unitEnv = (env) => Object.entries(env).map(([k, v]) => `Environment="${k}=${String(v).replace(/(["\\])/g, '\\$1')}"`).join('\n');
+
 /**
  * Render the launchd plist. Pure.
- * @param {{ nodePath: string, entryPath: string, logFile: string, pathEnv: string }} opts
+ * @param {{ nodePath: string, entryPath: string, logFile: string, pathEnv: string, env?: Record<string, string> }} opts
+ *   `env` is extra service environment (a provider key when no keychain exists); never logged.
  * @returns {string}
  */
-export function renderPlist({ nodePath, entryPath, logFile, pathEnv }) {
+export function renderPlist({ nodePath, entryPath, logFile, pathEnv, env = {} }) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -39,7 +45,7 @@ export function renderPlist({ nodePath, entryPath, logFile, pathEnv }) {
   <key>StandardErrorPath</key><string>${xml(logFile)}</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>${xml(pathEnv)}</string>
+${plistEnv({ PATH: pathEnv, ...env })}
   </dict>
 </dict>
 </plist>
@@ -48,10 +54,10 @@ export function renderPlist({ nodePath, entryPath, logFile, pathEnv }) {
 
 /**
  * Render the systemd user unit. Pure.
- * @param {{ nodePath: string, entryPath: string, logFile: string, pathEnv: string }} opts
+ * @param {{ nodePath: string, entryPath: string, logFile: string, pathEnv: string, env?: Record<string, string> }} opts
  * @returns {string}
  */
-export function renderUnit({ nodePath, entryPath, logFile, pathEnv }) {
+export function renderUnit({ nodePath, entryPath, logFile, pathEnv, env = {} }) {
   return `[Unit]
 Description=agents-switchboard loopback router
 After=network.target
@@ -60,7 +66,7 @@ After=network.target
 ExecStart=${nodePath} ${entryPath} serve
 Restart=always
 RestartSec=2
-Environment=PATH=${pathEnv}
+${unitEnv({ PATH: pathEnv, ...env })}
 StandardOutput=append:${logFile}
 StandardError=append:${logFile}
 
@@ -69,9 +75,23 @@ WantedBy=default.target
 `;
 }
 
+/** Where the Windows task reads its environment from: a user-only file the wrapper sources before `serve`. */
+export const windowsEnvFile = (home) => path.join(home, '.agents-switchboard', 'service.env.cmd');
+
+/**
+ * Render the Windows wrapper that loads the env file (if present) and starts the router. Pure.
+ * @param {{ nodePath: string, entryPath: string, envFile: string }} opts
+ * @returns {string}
+ */
+export function renderWindowsWrapper({ nodePath, entryPath, envFile }) {
+  return `@echo off\r\nif exist "${envFile}" call "${envFile}"\r\n"${nodePath}" "${entryPath}" serve\r\n`;
+}
+
 /**
  * Register the router as a login service and start it.
- * @param {{ nodePath?: string, entryPath: string, logFile: string, home?: string, platform?: string }} opts
+ * @param {{ nodePath?: string, entryPath: string, logFile: string, home?: string, platform?: string, env?: Record<string, string> }} opts
+ *   `env` is extra service environment, used to carry a provider key when the machine has no keychain. It is
+ *   written only into the user-only service definition and never printed.
  * @returns {Promise<{ kind: 'launchd'|'systemd'|'schtasks', file: string|null }>}
  */
 export async function installService(opts) {
@@ -79,7 +99,8 @@ export async function installService(opts) {
   const home = opts.home || os.homedir();
   const platform = opts.platform || process.platform;
   const pathEnv = process.env.PATH || '/usr/local/bin:/usr/bin:/bin';
-  const rendering = { nodePath, entryPath: opts.entryPath, logFile: opts.logFile, pathEnv };
+  const env = opts.env || {};
+  const rendering = { nodePath, entryPath: opts.entryPath, logFile: opts.logFile, pathEnv, env };
   fs.mkdirSync(path.dirname(opts.logFile), { recursive: true, mode: 0o700 });
 
   switch (platform) {
@@ -87,7 +108,7 @@ export async function installService(opts) {
       const file = plistPath(home);
       fs.mkdirSync(path.dirname(file), { recursive: true });
       await run('launchctl', ['bootout', `${launchdTarget()}/${LABEL}`]).catch(ignoreFailure); // not loaded yet
-      fs.writeFileSync(file, renderPlist(rendering));
+      fs.writeFileSync(file, renderPlist(rendering), { mode: 0o600 });
       try {
         await run('launchctl', ['bootstrap', launchdTarget(), file]);
       } catch {
@@ -99,18 +120,23 @@ export async function installService(opts) {
     case 'linux': {
       const file = unitPath(home);
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, renderUnit(rendering));
+      fs.writeFileSync(file, renderUnit(rendering), { mode: 0o600 });
       await run('systemctl', ['--user', 'daemon-reload']);
       await run('systemctl', ['--user', 'enable', '--now', UNIT]);
       await run('systemctl', ['--user', 'restart', UNIT]).catch(ignoreFailure); // enable --now already started a fresh unit
       return { kind: 'systemd', file };
     }
     case 'win32': {
-      const command = `"${nodePath}" "${opts.entryPath}" serve`;
+      // Scheduled tasks carry no per-task environment; a user-only env file sourced by a wrapper stands in.
+      const envFile = windowsEnvFile(home);
+      const wrapper = path.join(path.dirname(envFile), 'service.cmd');
+      fs.mkdirSync(path.dirname(envFile), { recursive: true, mode: 0o700 });
+      if (Object.keys(env).length) fs.writeFileSync(envFile, Object.entries(env).map(([k, v]) => `set "${k}=${v}"`).join('\r\n') + '\r\n', { mode: 0o600 });
+      fs.writeFileSync(wrapper, renderWindowsWrapper({ nodePath, entryPath: opts.entryPath, envFile }), { mode: 0o600 });
       await run('schtasks', ['/Delete', '/TN', LABEL, '/F']).catch(ignoreFailure); // not registered yet
-      await run('schtasks', ['/Create', '/TN', LABEL, '/SC', 'ONLOGON', '/RL', 'LIMITED', '/TR', command, '/F']);
+      await run('schtasks', ['/Create', '/TN', LABEL, '/SC', 'ONLOGON', '/RL', 'LIMITED', '/TR', `"${wrapper}"`, '/F']);
       await run('schtasks', ['/Run', '/TN', LABEL]).catch(ignoreFailure); // already running
-      return { kind: 'schtasks', file: null };
+      return { kind: 'schtasks', file: wrapper };
     }
     default:
       throw new Error(`unsupported platform ${platform}: run \`switchboard serve\` under your own supervisor`);

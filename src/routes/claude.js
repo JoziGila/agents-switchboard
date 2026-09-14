@@ -55,10 +55,11 @@ export function claudeRoutes(ctx) {
     const model = body.model;
     const role = req.headers['x-claude-code-agent-id'] ? 'subagent' : 'main';
     const t0 = Date.now();
+    // Every route needs the client's own credential: a provider key must not be spendable by any local process.
+    if (!requireClientAuth(req, res)) return;
     const provider = resolveProvider(providers, model);
     if (provider) return toProvider(req, res, provider, body, role, t0);
 
-    if (!requireClientAuth(req, res)) return;
     const fallback = failover.enabled ? resolveProvider(providers, failover.model) : null;
     if (fallback && failover.state.isActive('claude')) {
       log(`failover active for claude: ${model} → ${failover.model}`);
@@ -89,7 +90,8 @@ export function claudeRoutes(ctx) {
   async function countTokens(req, res, upstreamPath) {
     const raw = await readBody(req);
     let model = null;
-    try { model = JSON.parse(raw.toString('utf8')).model; } catch {}
+    try { model = JSON.parse(decodeBody(raw, req.headers['content-encoding']).toString('utf8')).model; }
+    catch (e) { sendJson(res, 400, anthropicError('invalid_request_error', `switchboard: cannot read request body: ${e.message}`)); return; }
     if (resolveProvider(providers, model)) { sendJson(res, 404, anthropicError('not_found_error', 'token counting is not available for this model')); return; }
     if (!requireClientAuth(req, res)) return;
     const url = new URL(upstreamPath, anthropic);

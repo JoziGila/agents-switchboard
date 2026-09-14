@@ -35,14 +35,71 @@ export function mapEffort(effort, ladder) {
   return table[e] ?? 'high';
 }
 
+/**
+ * Codex groups collaboration and MCP tools under `namespace` tools and expects returned calls to carry
+ * `namespace` + `name`. Providers know only flat function names, so a member is sent as
+ * `<namespace>__<name>` and the call is decoded back with the map this returns (never by string parsing:
+ * MCP namespaces already contain `__`).
+ */
+export function encodeToolName(namespace, name) {
+  return `${namespace}__${name}`;
+}
+
+/** Map of encoded wire name → { namespace, name } for every namespaced member in a tool list. */
+export function namespacedToolMap(tools) {
+  const map = new Map();
+  for (const t of tools ?? []) {
+    if (t?.type !== 'namespace') continue;
+    for (const inner of t.tools ?? []) if (inner?.name) map.set(encodeToolName(t.name, inner.name), { namespace: t.name, name: inner.name });
+  }
+  return map;
+}
+
 function flattenTools(tools, profile) {
   const out = [];
   for (const t of tools ?? []) {
     if (!t || typeof t !== 'object') continue;
-    if (t.type === 'namespace') { for (const inner of t.tools ?? []) pushTool(out, inner, profile); }
-    else pushTool(out, t, profile);
+    if (t.type === 'namespace') {
+      for (const inner of t.tools ?? []) {
+        if (!inner || typeof inner !== 'object') continue;
+        const prefixed = { ...inner, name: encodeToolName(t.name, inner.name) };
+        if (t.description && inner.type === 'function') prefixed.description = `[${t.name}] ${inner.description ?? ''}`.trim();
+        pushTool(out, prefixed, profile);
+      }
+    } else pushTool(out, t, profile);
   }
   return out;
+}
+
+/** History `function_call` items that carry a namespace must use the same encoded name the tools use. */
+function encodeCallItem(item) {
+  if (item?.type !== 'function_call' || !item.namespace) return item;
+  const { namespace, ...rest } = item;
+  return { ...rest, name: encodeToolName(namespace, item.name) };
+}
+
+/** Rewrite one function_call item from the provider back into Codex's namespace + name form. */
+function decodeCallItem(item, map) {
+  if (item?.type !== 'function_call') return item;
+  const hit = map.get(item.name);
+  return hit ? { ...item, name: hit.name, namespace: hit.namespace } : item;
+}
+
+/**
+ * SSE `data:` mapper for the Codex path: decodes namespaced calls in output items and normalises usage.
+ * @param {Map<string, {namespace: string, name: string}>} map from namespacedToolMap(originalTools)
+ */
+export function codexSseMapper(map) {
+  return (data) => {
+    let out = normalizeResponsesSseData(data);
+    if (!map.size || !out.includes('function_call')) return out;
+    try {
+      const j = JSON.parse(out);
+      if (j?.item) j.item = decodeCallItem(j.item, map);
+      if (Array.isArray(j?.response?.output)) j.response.output = j.response.output.map((i) => decodeCallItem(i, map));
+      return JSON.stringify(j);
+    } catch { return out; }
+  };
 }
 
 function pushTool(out, t, profile) {
@@ -95,6 +152,7 @@ function cleanInputItem(item, profile) {
     case 'reasoning': return cleanReasoningItem(rest, profile);
     case 'message': return ensureAssistantContent(rest);
     case 'agent_message': return agentMessageToUserMessage(rest);
+    case 'function_call': return encodeCallItem(rest);
     case 'function_call_output': return ensureToolOutput(rest, profile);
     default: return rest;
   }

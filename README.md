@@ -45,7 +45,7 @@ Requirements: Node 22.15+, Codex and/or Claude Code signed in with your subscrip
 2. Optionally asks for an OpenRouter key. Probes each provider on both API dialects.
 3. Registers and starts the login service (launchd on macOS, systemd user unit on Linux, scheduled task on Windows) and waits for `/switchboard/health`.
 4. Completes a real turn per client **through** the router using only a command-line override, so nothing on disk has changed yet.
-5. Only then edits `~/.codex/config.toml` and `~/.claude/settings.json` (backed up first), writes the role files, and appends a delegation policy to `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`.
+5. Only then edits `~/.codex/config.toml` and `~/.claude/settings.json` (backed up first), writes the role files, and appends a delegation policy to `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`. Both configs are pre-flighted before step 3, so a conflict or a corrupt file stops the install with nothing changed.
 6. Runs `doctor`.
 
 Restart the desktop apps once so they refetch models. Sessions already open keep their old connection.
@@ -63,14 +63,14 @@ What the clients end up with:
 
 | Command | Purpose |
 |---|---|
-| `install [--codex] [--claude] [--port N] [--pro] [--openrouter-key K]` | Configure detected clients, store the keys, start the service. `--pro` puts `reviewer` and `senior` on DeepSeek V4 Pro. |
+| `install [--codex] [--claude] [--port N] [--pro] [--openrouter-key K] [--dry-run]` | Configure detected clients, store the keys, start the service. `--pro` puts `reviewer` and `senior` on DeepSeek V4 Pro; `--dry-run` previews every file change. |
 | `doctor` | Check service, port, client config, subscription auth, DeepSeek key, upstream reachability, versions. |
 | `test` | Spawn a real explorer in each client and prove from the router log that it ran on DeepSeek. |
 | `status` | Routes, failover state, per-model and per-role tokens, cache hit ratio, estimated spend. Also at http://127.0.0.1:4141/switchboard/ |
 | `logs [-n N]` | Tail the request log (metadata only). |
 | `roles [--pro] [--reset]` | Rewrite the role files. |
 | `failover on\|off\|reset` | Control quota failover. |
-| `uninstall [--purge]` | Restore both clients from backup and remove the service. `--purge` also deletes the keychain entry. |
+| `uninstall [--purge]` | Restore both clients and remove the service; a config the installer never touched is left byte-identical. `--purge` also deletes every provider's keychain entry. |
 
 ## Safety
 

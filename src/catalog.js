@@ -84,10 +84,10 @@ export function catalogHash(changes) {
  * v1 sends the task in plaintext, which is what a child on another provider needs.
  */
 export function mergeModels(upstream, entries, { forceMultiAgentV1 = true } = {}) {
-  const models = (Array.isArray(upstream?.models) ? upstream.models : []).map((m) =>
-    forceMultiAgentV1 && m?.multi_agent_version === 'v2' ? { ...m, multi_agent_version: 'v1' } : m);
+  const v1 = (m) => (forceMultiAgentV1 && m?.multi_agent_version === 'v2' ? { ...m, multi_agent_version: 'v1' } : m);
+  const models = (Array.isArray(upstream?.models) ? upstream.models : []).map(v1);
   const present = new Set(models.map((m) => m.slug));
-  return { ...upstream, models: [...models, ...entries.filter((e) => !present.has(e.slug))] };
+  return { ...upstream, models: [...models, ...entries.filter((e) => !present.has(e.slug)).map(v1)] };
 }
 
 /** `"abc"` → `"abc+sb1234abcd"`; missing upstream ETag → `"sb1234abcd"`. Weak prefixes preserved. */

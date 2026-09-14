@@ -4,7 +4,7 @@ import readline from 'node:readline';
 import { Writable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { runInstall, runUninstall, detectClients } from '../install/index.js';
+import { runInstall, runUninstall, detectClients, preflight } from '../install/index.js';
 import { installService, uninstallService } from '../install/service.js';
 import { resolvePaths } from '../paths.js';
 import { loadConfig, saveConfig, listenAddress, resolveProviderKey, PROVIDER_KEY_ENV } from '../config.js';
@@ -98,15 +98,25 @@ export async function install(opts) {
     out('dry run: nothing written.'); return 0;
   }
   if (keys.abort) return 1;
-  saveConfig(cfg, paths);
+  // Refuse early: a conflict in either client aborts before the config, the key store or the service are touched.
+  try { preflight({ codex: wantCodex, claude: wantClaude, port, paths }); }
+  catch (e) { out(e.message); out('Nothing was changed.'); return 1; }
+
+  // Without a keychain the key rides in the service definition's environment (user-only file, never printed).
+  const serviceEnv = {};
   for (const [name, key] of Object.entries(keys.store)) {
     const section = cfg.upstream[name];
     if (keychainAvailable() && section.api_key?.keychain) { await setSecret(section.api_key.keychain, key); out(`${name} key stored in the OS keychain.`); }
-    else out(`warning: no OS keychain; put ${PROVIDER_KEY_ENV[name]} in the service environment and set api_key = { env = "${PROVIDER_KEY_ENV[name]}" } under [upstream.${name}] in ${paths.configFile}`);
+    else {
+      section.api_key = { env: PROVIDER_KEY_ENV[name] };
+      serviceEnv[PROVIDER_KEY_ENV[name]] = key;
+      out(`${name}: no OS keychain on this machine; the key is kept in the service definition's environment (${PROVIDER_KEY_ENV[name]}) and the switchboard config now reads it from there.`);
+    }
   }
+  saveConfig(cfg, paths);
 
   // 2. The router must be running and healthy before any client is pointed at it.
-  const svc = await installService({ nodePath: process.execPath, entryPath, logFile: path.join(paths.switchboardHome, 'service.log') });
+  const svc = await installService({ nodePath: process.execPath, entryPath, logFile: path.join(paths.switchboardHome, 'service.log'), env: serviceEnv });
   out(`service: ${svc.kind}${svc.file ? ` (${svc.file})` : ''}`);
   if (!(await waitHealthy(host, port))) {
     out(`The router did not come up on ${host}:${port} within 15 s. No client configuration was changed. Check ${path.join(paths.switchboardHome, 'service.log')}.`);
@@ -133,8 +143,10 @@ export async function install(opts) {
   for (const c of ['codex', 'claude']) if (report[c]) out(`${c}: ${summarize(report[c])}`);
   for (const w of report.warnings) out(`warning: ${w}`);
   out('\nDone. Sessions already open keep their old connection; new Codex and Claude Code sessions go through the router. Restart the desktop apps once so they refetch models.');
+  // The install itself succeeded; doctor's connectivity probes are informational and do not turn that into a failure.
   const { doctor } = await import('./doctor.js');
-  return doctor({ quiet: true });
+  const health = await doctor({ quiet: true, report: true });
+  return health.failed.some((r) => !r.connectivity) ? 1 : 0;
 }
 
 export async function uninstall(opts) {
@@ -146,9 +158,11 @@ export async function uninstall(opts) {
   out(`service: ${svc.removed ? 'removed' : 'not installed'}`);
   if (opts.purge) {
     const cfg = loadConfig(paths);
-    if (cfg.upstream.deepseek.api_key?.keychain) await deleteSecret(cfg.upstream.deepseek.api_key.keychain);
+    for (const [name, section] of Object.entries(cfg.upstream)) {
+      if (section.api_key?.keychain && (await deleteSecret(section.api_key.keychain))) out(`removed ${name} key from the OS keychain`);
+    }
     fs.rmSync(paths.switchboardHome, { recursive: true, force: true });
-    out('purged switchboard home and keychain entry');
+    out('purged switchboard home');
   }
   out('Sessions already open keep the router connection until restarted.');
   return 0;
