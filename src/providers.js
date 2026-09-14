@@ -15,7 +15,21 @@ const PROJECT_URL = 'https://github.com/JoziGila/agents-switchboard';
  * @property {(dialect: 'responses'|'messages', key: string) => Record<string,string>} authHeaders
  * @property {string[]} models                   ids advertised in the Codex picker
  * @property {Record<string, object>} modelOverrides  per-model catalog overrides
+ * @property {(dialect: 'responses'|'messages', conversationId: string|null, reqHeaders: object) => {body: object, headers: object}} requestOptions
+ *   provider-specific fields merged into the outgoing body and headers
  */
+
+/** OpenRouter routing preferences sent with every request; `[upstream.openrouter.provider]` overrides or extends. */
+const OPENROUTER_PROVIDER_DEFAULTS = {
+  // Only providers that support every parameter (tools, reasoning, parallel calls); the others would drop them silently.
+  require_parameters: true,
+  allow_fallbacks: true,
+};
+
+/** Claude Code beta values OpenRouter forwards to Anthropic-hosted models; login and client markers are not for a third party. */
+function betaForOpenRouter(anthropicBeta) {
+  return String(anthropicBeta ?? '').split(',').map((s) => s.trim()).filter((v) => v && !/^oauth-|^claude-code-/.test(v)).join(',');
+}
 
 /** Strip a Claude-style `[1m]` context suffix. */
 export function stripSuffix(model) {
@@ -44,6 +58,7 @@ export function buildProviders(config, keyFor) {
       authHeaders: (dialect, key) => (dialect === 'messages' ? { 'x-api-key': key, authorization: `Bearer ${key}`, 'anthropic-version': '2023-06-01' } : { authorization: `Bearer ${key}` }),
       models: ds.models ?? [],
       modelOverrides: ds.model_overrides ?? {},
+      requestOptions: () => ({ body: {}, headers: {} }),
     });
   }
   const or = config.upstream?.openrouter;
@@ -59,6 +74,15 @@ export function buildProviders(config, keyFor) {
       authHeaders: (dialect, key) => ({ authorization: `Bearer ${key}`, 'http-referer': PROJECT_URL, 'x-title': 'agents-switchboard', ...(dialect === 'messages' ? { 'anthropic-version': '2023-06-01' } : {}) }),
       models: or.models ?? [],
       modelOverrides: or.model_overrides ?? {},
+      requestOptions: (dialect, conversationId, reqHeaders) => {
+        const provider = { ...OPENROUTER_PROVIDER_DEFAULTS, ...(or.provider ?? {}) };
+        const body = { provider };
+        const headers = {};
+        // Sticky routing keeps a conversation on the provider that holds its prefix cache (10 min idle expiry).
+        if (conversationId) { headers['x-session-id'] = String(conversationId).slice(0, 256); if (dialect === 'responses') body.session_id = headers['x-session-id']; }
+        if (dialect === 'messages') { const beta = betaForOpenRouter(reqHeaders['anthropic-beta']); if (beta) headers['x-anthropic-beta'] = beta; }
+        return { body, headers };
+      },
     });
   }
   return providers;

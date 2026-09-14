@@ -3,7 +3,7 @@ import { resolveProvider } from '../providers.js';
 import { rewriteMessagesRequest, hasUnsignedThinking, stripUnsignedThinking, normalizeSseData, usageFromMessagesEvent, DEEPSEEK_MESSAGES, OPENROUTER_MESSAGES } from '../adapters/messages.js';
 import { readBody, decodeBody, sendJson, upstreamHeaders, upstreamRequest, relayResponse, passThrough, readResponse } from '../proxy.js';
 import { createSseRelay } from '../sse.js';
-import { providerHeaders, requireClientAuth, requireProviderKey } from './shared.js';
+import { providerHeaders, requireClientAuth, requireProviderKey, conversationId } from './shared.js';
 import { detectExhaustion } from '../failover.js';
 
 /** Claude Code aborts a stream silent for 300 s; a provider can think longer than that without a byte. */
@@ -21,13 +21,15 @@ export function claudeRoutes(ctx) {
   async function toProvider(req, res, provider, body, role, t0, via) {
     const key = await requireProviderKey(provider, res);
     if (!key) return;
-    const { body: rewritten, notes } = rewriteMessagesRequest(body, profileFor(provider));
+    const extra = provider.requestOptions('messages', conversationId(req.headers), req.headers);
+    const { body: adapted, notes } = rewriteMessagesRequest(body, profileFor(provider));
+    const rewritten = { ...adapted, ...extra.body };
     if (notes.length) log(`messages adapter (${provider.name}): ${notes.join('; ')}`);
     const url = new URL(provider.messagesPath, provider.baseUrl);
     const payload = Buffer.from(JSON.stringify(rewritten));
     const entry = { client: 'claude', route: 'messages', model: rewritten.model, role, upstream: provider.name, ...(via ? { via } : {}) };
     let up;
-    try { up = await upstreamRequest(url, { method: 'POST', headers: providerHeaders(req.headers, url, provider.authHeaders('messages', key), payload.length), body: payload }); }
+    try { up = await upstreamRequest(url, { method: 'POST', headers: providerHeaders(req.headers, url, { ...provider.authHeaders('messages', key), ...extra.headers }, payload.length), body: payload }); }
     catch (e) { sendJson(res, 502, anthropicError('api_error', `switchboard: ${provider.name} unreachable: ${e.message}`)); stats.record({ ...entry, error: e.message }); return; }
     if (up.statusCode < 200 || up.statusCode >= 300) {
       // Auth and billing failures must not reach the client as 401/402/403 (token refresh); everything else is the provider's own Anthropic-shaped error.

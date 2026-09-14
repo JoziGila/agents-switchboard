@@ -33,7 +33,7 @@ Requests are routed by model. GPT and Claude traffic passes through untouched, i
 
 ## OpenRouter too
 
-Any OpenRouter model works as a main model or a subagent in both clients: give the router an OpenRouter key at install time (optional), then use OpenRouter's own ids, `deepseek/deepseek-v4.1-flash`, `qwen/qwen3-coder`, `~anthropic/claude-opus-latest`. The id's `vendor/model` shape is what routes it; nothing to register. Models you list under `[upstream.openrouter] models` in `~/.agents-switchboard/config.toml` also show up in the Codex picker. OpenRouter's own encrypted reasoning chains are sent back only to OpenRouter, and its reported cost feeds the status page.
+Any OpenRouter model works as a main model or a subagent in both clients: give the router an OpenRouter key at install time (optional), then use OpenRouter's own ids, `deepseek/deepseek-v4.1-flash`, `qwen/qwen3-coder`, `~anthropic/claude-opus-latest`. The id's `vendor/model` shape is what routes it; nothing to register. Models you list under `[upstream.openrouter] models` in `~/.agents-switchboard/config.toml` also show up in the Codex picker. Every OpenRouter request carries `provider.require_parameters` so tools and reasoning never get silently dropped, a stable session id so the conversation sticks to the provider holding its prefix cache, and attribution headers; put `sort = "throughput"` or `data_collection = "deny"` under `[upstream.openrouter.provider]` to tune it. OpenRouter's own encrypted reasoning chains are sent back only to OpenRouter, and its reported cost feeds the status page.
 
 ## Install
 

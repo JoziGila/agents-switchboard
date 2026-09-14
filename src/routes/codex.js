@@ -5,7 +5,7 @@ import { rewriteResponsesRequest, mapUpstreamError, usageFromResponsesEvent, rea
 import { readBody, decodeBody, sendJson, upstreamHeaders, upstreamRequest, relayResponse, passThrough, readResponse } from '../proxy.js';
 import { detectExhaustion, liftResponsesLite } from '../failover.js';
 import { createSseRelay } from '../sse.js';
-import { CODEX_PREFIX, providerHeaders, modelFromRoutingHint, requireClientAuth, requireProviderKey } from './shared.js';
+import { CODEX_PREFIX, providerHeaders, modelFromRoutingHint, requireClientAuth, requireProviderKey, conversationId } from './shared.js';
 
 /** @param {import('../server.js').RouteContext} ctx */
 export function codexRoutes(ctx) {
@@ -33,12 +33,13 @@ export function codexRoutes(ctx) {
   async function toProvider(req, res, provider, body, model, role, t0, via) {
     const key = await requireProviderKey(provider, res);
     if (!key) return;
-    const rewritten = rewriteResponsesRequest({ ...liftResponsesLite(body), model: stripSuffix(model) }, profileFor(provider));
+    const extra = provider.requestOptions('responses', conversationId(req.headers), req.headers);
+    const rewritten = { ...rewriteResponsesRequest({ ...liftResponsesLite(body), model: stripSuffix(model) }, profileFor(provider)), ...extra.body };
     const url = new URL(provider.responsesPath, provider.baseUrl);
     const payload = Buffer.from(JSON.stringify(rewritten));
     const entry = { client: 'codex', route: 'responses', model: rewritten.model, role, upstream: provider.name, ...(via ? { via } : {}) };
     let up;
-    try { up = await upstreamRequest(url, { method: 'POST', headers: providerHeaders(req.headers, url, provider.authHeaders('responses', key), payload.length), body: payload }); }
+    try { up = await upstreamRequest(url, { method: 'POST', headers: providerHeaders(req.headers, url, { ...provider.authHeaders('responses', key), ...extra.headers }, payload.length), body: payload }); }
     catch (e) { sendJson(res, 502, { error: { type: 'server_error', message: `switchboard: ${provider.name} unreachable: ${e.message}` } }); stats.record({ ...entry, error: e.message }); return; }
     if (up.statusCode < 200 || up.statusCode >= 300) {
       const mapped = mapUpstreamError(up.statusCode, (await readResponse(up)).toString('utf8'), provider.name);

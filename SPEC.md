@@ -223,6 +223,9 @@ Both adapters take a profile, so one code path serves every provider and the dif
 | Unsupported content blocks | `document`, `search_result`, `redacted_thinking` dropped | all kept |
 | Empty assistant content, empty tool output | `""` and `(no output)` placeholders (harness rule) | left as sent |
 | Auth | `Authorization: Bearer` (Responses), `x-api-key` + Bearer (Messages) | `Authorization: Bearer` plus `HTTP-Referer` and `X-Title` attribution |
+| Routing preferences | none | `provider: { require_parameters: true, allow_fallbacks: true }` by default, so a request with tools or reasoning never lands on a provider that would drop them silently; `[upstream.openrouter.provider]` adds or overrides keys (`sort = "throughput"`, `data_collection = "deny"`, `order`, `ignore`, `max_price`, `preferred_min_throughput`), and a `:nitro` or `:floor` model suffix works as OpenRouter documents |
+| Sticky routing | not applicable | `session_id` (Responses body) and `x-session-id` (both dialects) set from the conversation: Codex `thread-id`, Claude Code session id plus agent id. OpenRouter then keeps the conversation on the provider that holds its prefix cache; the affinity expires after 10 idle minutes. Not sent when `provider.order` is configured, since OpenRouter disables stickiness then |
+| Anthropic beta features | dropped | Claude Code's `anthropic-beta` values are forwarded as `x-anthropic-beta` minus the login and client markers, so interleaved thinking and structured outputs survive on Anthropic-hosted models |
 | Cost | estimated from the bundled DeepSeek price table with peak detection | taken from `usage.cost` when OpenRouter reports it |
 | Errors | never 401/402/403 to the client; OpenRouter's `error.metadata.error_type` and `provider_name` are folded into the message |
 
@@ -456,6 +459,10 @@ models = ["deepseek/deepseek-v4.1-flash", "qwen/qwen3-coder"]  # advertised in t
 
 [upstream.openrouter.model_overrides."qwen/qwen3-coder"]
 context_window = 262144
+
+[upstream.openrouter.provider]            # merged over { require_parameters = true, allow_fallbacks = true }
+sort = "throughput"                       # or omit to keep OpenRouter's price-weighted balancing and sticky routing
+data_collection = "deny"
 
 [failover]
 enabled = true

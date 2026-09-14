@@ -147,13 +147,17 @@ test('websocket upgrade is declined with 426', async () => {
 
 test('codex openrouter model routes to openrouter with attribution headers and cost', async () => {
   const body = zlib.zstdCompressSync(Buffer.from(JSON.stringify({ model: 'qwen/qwen3-coder', input: [], reasoning: { effort: 'xhigh' } })));
-  const r = await post('/backend-api/codex/responses', body, { 'content-encoding': 'zstd', authorization: 'Bearer chatgpt', 'x-codex-routing-hint': 'model=qwen/qwen3-coder' });
+  const r = await post('/backend-api/codex/responses', body, { 'content-encoding': 'zstd', authorization: 'Bearer chatgpt', 'x-codex-routing-hint': 'model=qwen/qwen3-coder', 'thread-id': 'thr-1' });
   assert.equal(r.status, 200); await r.text();
   const up = seen.openrouter.at(-1);
   assert.equal(up.url, '/v1/responses');
   assert.equal(up.headers.authorization, 'Bearer sk-or-test');
   assert.equal(up.headers['x-title'], 'agents-switchboard');
-  assert.equal(JSON.parse(up.body.toString()).reasoning.effort, 'high');
+  const sentBody = JSON.parse(up.body.toString());
+  assert.equal(sentBody.reasoning.effort, 'high');
+  assert.deepEqual(sentBody.provider, { require_parameters: true, allow_fallbacks: true });
+  assert.equal(sentBody.session_id, 'thr-1');
+  assert.equal(up.headers['x-session-id'], 'thr-1');
   const snap = sb.statusJson();
   assert.equal(snap.models['qwen/qwen3-coder'].requests, 1);
   assert.ok(snap.models['qwen/qwen3-coder'].usd > 0, 'cost from usage.cost');
@@ -170,14 +174,17 @@ test('openrouter reasoning provenance: its own encrypted items go back, foreign 
 
 test('claude openrouter model routes to /v1/messages with adaptive thinking kept', async () => {
   const body = JSON.stringify({ model: 'anthropic/claude-sonnet-5[1m]', thinking: { type: 'adaptive' }, messages: [{ role: 'user', content: 'hi' }] });
-  const r = await post('/anthropic/v1/messages?beta=true', body, { authorization: 'Bearer sk-ant-oat', 'anthropic-beta': 'oauth-2025-04-20' });
+  const r = await post('/anthropic/v1/messages?beta=true', body, { authorization: 'Bearer sk-ant-oat', 'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14', 'x-claude-code-session-id': 'sess-1', 'x-claude-code-agent-id': 'ag-2' });
   assert.equal(r.status, 200); await r.text();
   const up = seen.openrouter.at(-1);
   assert.equal(up.url, '/v1/messages');
   const sent = JSON.parse(up.body.toString());
   assert.equal(sent.model, 'anthropic/claude-sonnet-5');
   assert.deepEqual(sent.thinking, { type: 'adaptive' });
+  assert.equal(sent.provider.require_parameters, true);
   assert.equal(up.headers['anthropic-beta'], undefined);
+  assert.equal(up.headers['x-anthropic-beta'], 'interleaved-thinking-2025-05-14');
+  assert.equal(up.headers['x-session-id'], 'sess-1/ag-2');
 });
 
 test('codex quota 429 fails the turn over to the fallback provider and stays there until reset', async () => {

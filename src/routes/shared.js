@@ -48,5 +48,7 @@ export async function requireProviderKey(provider, res) {
 
 /** Conversation identity for cache-affine routing and attribution, per client. */
 export function conversationId(headers) {
-  return headers['thread-id'] ?? headers['x-claude-code-session-id'] ?? headers['session-id'] ?? null;
+  if (headers['thread-id']) return String(headers['thread-id']);
+  if (headers['x-claude-code-session-id']) return [headers['x-claude-code-session-id'], headers['x-claude-code-agent-id']].filter(Boolean).join('/');
+  return headers['session-id'] ? String(headers['session-id']) : null;
 }
