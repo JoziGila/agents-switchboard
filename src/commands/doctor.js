@@ -1,8 +1,9 @@
 // `switchboard doctor`: a data-driven list of health checks with one line of output each.
 import fs from 'node:fs';
 import path from 'node:path';
-import { probeDeepSeek } from '../adapters/probe.js';
-import { loadConfig, listenAddress, resolveDeepSeekKey } from '../config.js';
+import { probeProvider } from '../adapters/probe.js';
+import { buildProviders } from '../providers.js';
+import { loadConfig, listenAddress, resolveProviderKey, PROVIDER_KEY_ENV } from '../config.js';
 import { baseUrlFor as claudeUrl } from '../install/claude.js';
 import { baseUrlFor as codexUrl } from '../install/codex.js';
 import { detectClients } from '../install/index.js';
@@ -40,7 +41,7 @@ async function gatherContext(opts) {
     detected: await detectClients(paths),
     codexToml: fs.existsSync(path.join(paths.codexHome, 'config.toml')) ? fs.readFileSync(path.join(paths.codexHome, 'config.toml'), 'utf8') : '',
     claudeSettings,
-    key: await resolveDeepSeekKey(cfg),
+    providers: await Promise.all(buildProviders(cfg, async () => null).map(async (p) => ({ provider: p, key: await resolveProviderKey(cfg.upstream[p.name], PROVIDER_KEY_ENV[p.name]) }))),
   };
 }
 
@@ -68,6 +69,12 @@ const roleFilesExist = (dir, extension) => ROLE_NAMES.every((name) => fs.existsS
  * Each check: `name` (string or function of ctx), `when` (optional gate), `run` returning a boolean or `{ ok, detail }`.
  * Adding a check is one entry here.
  */
+const providerChecks = (c) => c.providers.flatMap(({ provider, key }) => [
+  { name: `${provider.name} key present`, run: () => ({ ok: provider.name !== 'deepseek' || !!key, detail: key ? 'keychain/env' : provider.name === 'deepseek' ? 'run `switchboard install` with a key' : 'optional; add with `switchboard install --openrouter-key …`' }) },
+  { name: `${provider.name} responses API`, when: () => key && !c.opts.offline, run: async () => { c.probes ??= {}; c.probes[provider.name] = await probeProvider(provider, key); return { ok: c.probes[provider.name].responses.ok, detail: c.probes[provider.name].responses.error ?? '' }; } },
+  { name: `${provider.name} messages API`, when: () => key && !c.opts.offline, run: () => ({ ok: c.probes[provider.name].messages.ok, detail: c.probes[provider.name].messages.error ?? '' }) },
+]);
+
 const CHECKS = [
   { name: `node >= ${MIN_NODE.replace(/\.0$/, '')}`, run: () => ({ ok: semverGte(process.versions.node, MIN_NODE), detail: process.versions.node }) },
   { name: 'switchboard config', run: (c) => ({ ok: fs.existsSync(c.paths.configFile), detail: c.paths.configFile }) },
@@ -86,9 +93,6 @@ const CHECKS = [
   { name: 'claude has no API-key credential (subscription stays active)', when: (c) => c.detected.claude.present, run: (c) => !c.claudeSettings.env?.ANTHROPIC_API_KEY && !c.claudeSettings.env?.ANTHROPIC_AUTH_TOKEN && !c.claudeSettings.apiKeyHelper && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN },
   { name: 'claude role files', when: (c) => c.detected.claude.present, run: (c) => roleFilesExist(path.join(c.paths.claudeHome, 'agents'), '.md') },
 
-  { name: 'deepseek key present', run: (c) => ({ ok: !!c.key, detail: c.key ? 'keychain/env' : 'run `switchboard install` with a key' }) },
-  { name: 'deepseek responses API', when: (c) => c.key && !c.opts.offline, run: async (c) => { const p = await probeDeepSeek(c.key, c.cfg.upstream.deepseek.base_url); c.probe = p; return { ok: p.responses.ok, detail: p.responses.error ?? '' }; } },
-  { name: 'deepseek messages API', when: (c) => c.key && !c.opts.offline, run: (c) => ({ ok: c.probe.messages.ok, detail: c.probe.messages.error ?? '' }) },
   { name: 'chatgpt.com reachable', when: (c) => !c.opts.offline, run: (c) => reachable(c.cfg.upstream.openai.base_url, REACH_TIMEOUT_MS) },
   { name: 'api.anthropic.com reachable', when: (c) => !c.opts.offline, run: (c) => reachable(c.cfg.upstream.anthropic.base_url, REACH_TIMEOUT_MS) },
 ];
@@ -101,7 +105,7 @@ const CHECKS = [
 export async function doctor(opts = {}) {
   const ctx = await gatherContext(opts);
   const results = [];
-  for (const check of CHECKS) {
+  for (const check of [...CHECKS, ...providerChecks(ctx)]) {
     if (check.when && !check.when(ctx)) continue;
     const outcome = await check.run(ctx);
     const { ok, detail = '' } = typeof outcome === 'object' ? outcome : { ok: outcome };

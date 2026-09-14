@@ -18,6 +18,12 @@ export const DEFAULT_CONFIG = Object.freeze({
       api_key: { keychain: 'agents-switchboard/deepseek' },
       models: ['deepseek-flash', 'deepseek-v4-pro'],
     },
+    openrouter: {
+      base_url: 'https://openrouter.ai/api',
+      api_key: { keychain: 'agents-switchboard/openrouter' },
+      // Advertised in the Codex picker; any vendor/model id routes to OpenRouter regardless.
+      models: [],
+    },
   },
   failover: { enabled: false, model: 'deepseek-flash' },
 });
@@ -81,11 +87,27 @@ export function listenAddress(cfg) {
  * @param {{ env?: NodeJS.ProcessEnv, getSecret?: (name: string) => Promise<string|null> }} [deps]
  * @returns {Promise<string|null>}
  */
-export async function resolveDeepSeekKey(cfg, deps = {}) {
+/**
+ * Resolve the API key of an upstream section: `{ env }` reads that variable, `{ keychain }` reads the
+ * OS keychain and falls back to `envDefault`; no `api_key` at all means `envDefault` only.
+ * @param {object} section   e.g. cfg.upstream.deepseek
+ * @param {string} envDefault  e.g. 'DEEPSEEK_API_KEY'
+ * @param {{env?: object, getSecret?: (name: string) => Promise<string|null>}} [deps]
+ * @returns {Promise<string|null>}
+ */
+export async function resolveProviderKey(section, envDefault, deps = {}) {
   const env = deps.env || process.env;
   const readSecret = deps.getSecret || getSecret;
-  const source = cfg.upstream?.deepseek?.api_key || {};
+  const source = section?.api_key || {};
   if (source.env) return env[source.env] || null;
-  if (source.keychain) return (await readSecret(source.keychain)) || env.DEEPSEEK_API_KEY || null;
-  return env.DEEPSEEK_API_KEY || null;
+  if (source.keychain) return (await readSecret(source.keychain)) || env[envDefault] || null;
+  return env[envDefault] || null;
+}
+
+/** Env var that carries a provider's key when no keychain entry exists. */
+export const PROVIDER_KEY_ENV = { deepseek: 'DEEPSEEK_API_KEY', openrouter: 'OPENROUTER_API_KEY' };
+
+/** @deprecated use resolveProviderKey(cfg.upstream.deepseek, 'DEEPSEEK_API_KEY') */
+export async function resolveDeepSeekKey(cfg, deps = {}) {
+  return resolveProviderKey(cfg.upstream?.deepseek, PROVIDER_KEY_ENV.deepseek, deps);
 }

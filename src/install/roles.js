@@ -9,9 +9,9 @@ export const MANAGED_MD = '<!-- managed by agents-switchboard -->';
 export const ROLE_NAMES = ['explorer', 'worker', 'reviewer', 'senior'];
 
 const INSTRUCTIONS = {
-  explorer: "You are an explorer. Answer the parent's question about the codebase with file paths and line references. Do not modify files. Do not speculate beyond what you read. Be brief.",
-  worker: 'You are a worker. Implement exactly the task the parent specified, run the relevant tests, and report the diff summary and test output. If the task is under-specified or you are blocked, stop and say what you need instead of guessing.',
-  reviewer: 'You are a reviewer. Read the diff and the surrounding code. Report concrete defects with file and line, ranked by severity. Do not restate the diff. Say clearly when you find nothing.',
+  explorer: "You are an explorer. Answer the parent's question about the codebase with file paths and line references. Read as much as you need; report only what the parent needs: a direct answer first, then the evidence, at most a screenful. Do not modify files. Do not speculate beyond what you read.",
+  worker: 'You are a worker. Implement exactly the task the parent specified, run the relevant tests, and report a short diff summary and the test result, at most a screenful; include failing output verbatim only for the failures. If the task is under-specified or you are blocked, stop and say what you need instead of guessing.',
+  reviewer: 'You are a reviewer. Read the diff and the surrounding code, run the tests if they exist. Report concrete defects with file and line, ranked by severity, each with a one-line fix suggestion. Do not restate the diff. Say clearly when you find nothing.',
   senior: "You are the senior engineer. You receive tasks a faster model could not complete. Read the previous attempt's report first, then solve the task end to end.",
 };
 
@@ -116,12 +116,14 @@ export const DELEGATION_BLOCK = [
   DELEGATION_START,
   '## Delegation',
   '',
-  "Subagents run on DeepSeek Flash by default: fast, 1M context, roughly 50x cheaper than this session's model. Use them freely for bounded work; keep judgement here.",
+  "Subagents run on DeepSeek Flash: 1M context, roughly 50x cheaper than this session, and their context never enters yours. Every file you read, test you run, or log you scan in this session spends the expensive budget; done in a subagent it costs cents and returns a summary. Delegate by default, keep judgement here.",
   '',
-  '- explorer: any question about existing code. Spawn several in parallel for independent questions. Trust their file references; verify only what you change.',
-  '- worker: implementation that fits in one message: exact files, exact behaviour, how to test. Split larger tasks first.',
-  '- reviewer: every non-trivial diff before you accept it.',
-  "- senior: only after a worker failed twice on the same task, or for cross-module design decisions. Pass the failed attempt's report.",
+  '- explorer: anything that means reading before deciding: where is X, how does Y work, what does this test output mean, what changed in this diff. Give one precise question per explorer and spawn several in parallel. Trust their file:line references; verify only what you change.',
+  '- worker: implementation that fits in one message: exact files, exact behaviour, how to verify. It runs the tests and reports the diff summary and results. Split larger work into worker-sized pieces first.',
+  '- reviewer: every non-trivial diff before you accept it, and before you tell the user it is done.',
+  "- senior: only after a worker failed twice on the same task, or for a decision that spans modules. Pass the failed attempt's report so it does not start from zero.",
+  '',
+  'Brief each subagent with the goal, the exact files or commands, and the shape of answer you want. Ask for at most a screenful back. Never paste large outputs into this session; ask an explorer to summarise them.',
   '',
   'Do not delegate: choosing an approach, resolving ambiguity with the user, anything that depends on screenshots or images unless you describe them in text first.',
   DELEGATION_END,

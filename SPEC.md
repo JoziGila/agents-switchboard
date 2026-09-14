@@ -1,6 +1,6 @@
 # agents-switchboard — Specification
 
-Status: v0.5, 2026-09-14. Both base-URL contracts verified live (§2.1). Phase 1 implemented, installed on the author's machine, and verified with `switchboard test`: a Codex explorer ran 14 requests on DeepSeek Flash (94% cache hits) and a Claude Code explorer ran on Flash.
+Status: v0.6, 2026-09-14. OpenRouter added as a second provider for both clients; DeepSeek integration follows DeepSeek's own harness (Appendix D, docs/deepseek-standard.md). Both base-URL contracts verified live (§2.1). Phase 1 implemented, installed on the author's machine, and verified with `switchboard test`: a Codex explorer ran 14 requests on DeepSeek Flash (94% cache hits) and a Claude Code explorer ran on Flash.
 Reviewed against: openai/codex `main` @ 2f8603f (CLI 0.154.0, desktop runtime 0.154.0-alpha.6.2); Claude Code 2.1.270 and its gateway protocol docs; DeepSeek API docs (Responses API, Anthropic-compatible API, context caching, pricing) as of 2026-09-14.
 
 ## 1. Summary
@@ -107,7 +107,15 @@ Runtime: Node 22+, no native modules, single npm package `agents-switchboard`, b
 | Claude | anything else under `/anthropic/` | Anthropic | Pass-through. |
 | any | `/switchboard/*` | local | Status and control. |
 
-A model is DeepSeek-bound when its id, after stripping a Claude-style `[1m]` suffix, appears in the DeepSeek catalog the switchboard serves. For Codex the id comes from the `x-codex-routing-hint` header, so GPT bodies are never decompressed; for Claude Code it comes from the JSON body. The catalog is the single source of truth for both the Codex picker entries and the routing decision, so a model can never be advertised without a route.
+A request leaves the client's own vendor only when a provider claims its model id (after stripping a Claude-style `[1m]` suffix). The rule is the id's shape, so no list has to be maintained for routing:
+
+| Id shape | Provider | Examples |
+|---|---|---|
+| `deepseek-*` (no slash) | DeepSeek direct | `deepseek-flash`, `deepseek-v4-pro` |
+| `vendor/model`, optionally `~vendor/alias` or a `:variant` suffix | OpenRouter | `deepseek/deepseek-v4.1-flash`, `qwen/qwen3-coder`, `~anthropic/claude-opus-latest`, `openai/gpt-5.5:nitro` |
+| anything else | pass-through to the client's vendor | `gpt-6-astra`, `claude-sonnet-5` |
+
+For Codex the id comes from the `x-codex-routing-hint` header, so pass-through bodies are never decompressed; for Claude Code it comes from the JSON body. The catalog (§5) decides only what is advertised in the Codex picker; any OpenRouter id typed into either client routes correctly whether or not it is advertised. The catalog is the single source of truth for both the Codex picker entries and the routing decision, so a model can never be advertised without a route.
 
 ### 4.2 Pass-through contract
 
@@ -139,6 +147,8 @@ The bundled entries (`catalog/deepseek.models.json`) are the ones DeepSeek ships
 | `input_modalities` | text, image | Flash accepts images. V4 Pro is text only. |
 | `base_instructions` | 17.7 KB, identical for every role | The shared cache prefix (§9). |
 | `prefer_websockets` | `false` | HTTP only. |
+
+OpenRouter models listed under `[upstream.openrouter] models` get a generic entry derived from the Flash template: plain function tools, function-style `apply_patch` (OpenRouter's Responses API documents function tools only), no responses-lite, a 262K context and a `low | medium | high` effort menu by default. `[upstream.openrouter.model_overrides."vendor/model"]` overrides any field, typically `context_window` and `display_name`.
 
 `deepseek-v4-pro` is a second, optional entry. DeepSeek's Responses API doc lists only `deepseek-flash`, while their Codex script registers both; the installer probes each slug and advertises the ones that answer.
 
@@ -195,6 +205,26 @@ Response handling:
 - Error bodies forwarded unmodified. Claude Code matches on upstream error wording to decide its own recovery, and wrapping breaks that.
 
 Thinking blocks across providers: Anthropic rejects thinking blocks it did not sign. When a conversation that ran on DeepSeek returns to Claude (failback, or the user switching models), the switchboard strips assistant `thinking` blocks that carry no signature from Anthropic-bound requests. Claude Code would recover on its own after one rejected request; stripping saves that round trip.
+
+### 6.3 Provider profiles
+
+Both adapters take a profile, so one code path serves every provider and the differences are data:
+
+| | DeepSeek | OpenRouter |
+|---|---|---|
+| Responses endpoint | `/responses` | `/v1/responses` (stateless; rejects `store: true` and `previous_response_id`, both removed anyway) |
+| Messages endpoint | `/anthropic/v1/messages` | `/v1/messages` |
+| Effort ladder | `low, high, max` | `minimal, low, medium, high` |
+| Custom tools kept | `apply_patch` | none (function tools only) |
+| Encrypted reasoning sent back | never | only for items OpenRouter itself produced, tracked by id in a bounded in-memory provenance set, so a fork from a GPT parent never forwards OpenAI's encrypted items and an OpenRouter-main session keeps its own chains |
+| `thinking: adaptive` | rewritten to `enabled` | passed through (OpenRouter forwards it to Anthropic-hosted models) |
+| `output_config.format` | dropped | kept |
+| Mid-conversation `system` messages | converted to `user` | converted to `user` |
+| Unsupported content blocks | `document`, `search_result`, `redacted_thinking` dropped | all kept |
+| Empty assistant content, empty tool output | `""` and `(no output)` placeholders (harness rule) | left as sent |
+| Auth | `Authorization: Bearer` (Responses), `x-api-key` + Bearer (Messages) | `Authorization: Bearer` plus `HTTP-Referer` and `X-Title` attribution |
+| Cost | estimated from the bundled DeepSeek price table with peak detection | taken from `usage.cost` when OpenRouter reports it |
+| Errors | never 401/402/403 to the client; OpenRouter's `error.metadata.error_type` and `provider_name` are folded into the message |
 
 ## 7. WebSocket policy (Codex)
 
@@ -364,18 +394,20 @@ You are an explorer. Answer the parent's question about the codebase with file p
 
 ### 10.3 Delegation policy
 
-The same marked block is appended to `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`, so the parent model delegates by estimated capability rather than by habit:
+The same marked block is appended to `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`. It is the only orchestration machinery: no scheduler, no router-side routing by task. The policy pushes reading, running and reviewing into Flash subagents, whose context never enters the frontier session, which is where the subscription budget actually goes. Role instructions ask for a screenful back, so a subagent's work returns as a summary rather than as raw output.
 
 ```markdown
 <!-- agents-switchboard delegation policy -->
 ## Delegation
 
-Subagents run on DeepSeek Flash by default: fast, 1M context, roughly 50x cheaper than this session's model. Use them freely for bounded work; keep judgement here.
+Subagents run on DeepSeek Flash: 1M context, roughly 50x cheaper than this session, and their context never enters yours. Every file you read, test you run, or log you scan in this session spends the expensive budget; done in a subagent it costs cents and returns a summary. Delegate by default, keep judgement here.
 
-- explorer: any question about existing code. Spawn several in parallel for independent questions. Trust their file references; verify only what you change.
-- worker: implementation that fits in one message: exact files, exact behaviour, how to test. Split larger tasks first.
-- reviewer: every non-trivial diff before you accept it.
-- senior: only after a worker failed twice on the same task, or for cross-module design decisions. Pass the failed attempt's report.
+- explorer: anything that means reading before deciding: where is X, how does Y work, what does this test output mean, what changed in this diff. Give one precise question per explorer and spawn several in parallel. Trust their file:line references; verify only what you change.
+- worker: implementation that fits in one message: exact files, exact behaviour, how to verify. It runs the tests and reports the diff summary and results. Split larger work into worker-sized pieces first.
+- reviewer: every non-trivial diff before you accept it, and before you tell the user it is done.
+- senior: only after a worker failed twice on the same task, or for a decision that spans modules. Pass the failed attempt's report so it does not start from zero.
+
+Brief each subagent with the goal, the exact files or commands, and the shape of answer you want. Ask for at most a screenful back. Never paste large outputs into this session; ask an explorer to summarise them.
 
 Do not delegate: choosing an approach, resolving ambiguity with the user, anything that depends on screenshots or images unless you describe them in text first.
 <!-- /agents-switchboard -->
@@ -417,10 +449,20 @@ base_url = "https://api.deepseek.com"
 api_key = { keychain = "agents-switchboard/deepseek" }   # or { env = "DEEPSEEK_API_KEY" }
 models = ["deepseek-flash", "deepseek-v4-pro"]
 
+[upstream.openrouter]
+base_url = "https://openrouter.ai/api"
+api_key = { keychain = "agents-switchboard/openrouter" }   # or { env = "OPENROUTER_API_KEY" }; optional
+models = ["deepseek/deepseek-v4.1-flash", "qwen/qwen3-coder"]  # advertised in the Codex picker; any vendor/model id routes regardless
+
+[upstream.openrouter.model_overrides."qwen/qwen3-coder"]
+context_window = 262144
+
 [failover]
 enabled = true
 model = "deepseek-flash"
 ```
+
+`install` asks for the OpenRouter key as an optional second prompt (`--openrouter-key`, or `OPENROUTER_API_KEY`) and probes it on both dialects. To run subagents on an OpenRouter model instead of DeepSeek direct, set `agents.default_subagent_model` and `CLAUDE_CODE_SUBAGENT_MODEL` to its id, or point a single role file at it.
 
 ## 12. Observability
 

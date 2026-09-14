@@ -31,6 +31,10 @@ Claude Code ── ANTHROPIC_BASE_URL ──▶ 127.0.0.1:4141/anthropic ──�
 
 Requests are routed by model. GPT and Claude traffic passes through untouched, including every header and the compressed body. DeepSeek-bound requests get a small, deterministic rewrite (fields DeepSeek does not support are removed, nothing is reordered) so DeepSeek's prefix cache keeps hitting. Full design, with references into the Codex source and the Claude Code gateway docs, in [SPEC.md](SPEC.md).
 
+## OpenRouter too
+
+Any OpenRouter model works as a main model or a subagent in both clients: give the router an OpenRouter key at install time (optional), then use OpenRouter's own ids, `deepseek/deepseek-v4.1-flash`, `qwen/qwen3-coder`, `~anthropic/claude-opus-latest`. The id's `vendor/model` shape is what routes it; nothing to register. Models you list under `[upstream.openrouter] models` in `~/.agents-switchboard/config.toml` also show up in the Codex picker. OpenRouter's own encrypted reasoning chains are sent back only to OpenRouter, and its reported cost feeds the status page.
+
 ## Install
 
 Requirements: Node 22.15+, Codex and/or Claude Code signed in with your subscription, a DeepSeek API key from [platform.deepseek.com](https://platform.deepseek.com).
@@ -38,7 +42,7 @@ Requirements: Node 22.15+, Codex and/or Claude Code signed in with your subscrip
 `node bin/switchboard.js install` does the following, in this order, and stops at the first failure without touching your clients:
 
 1. Detects Codex and Claude Code and asks for the DeepSeek key (stored in the OS keychain, never in a file).
-2. Probes DeepSeek on both API dialects.
+2. Optionally asks for an OpenRouter key. Probes each provider on both API dialects.
 3. Registers and starts the login service (launchd on macOS, systemd user unit on Linux, scheduled task on Windows) and waits for `/switchboard/health`.
 4. Completes a real turn per client **through** the router using only a command-line override, so nothing on disk has changed yet.
 5. Only then edits `~/.codex/config.toml` and `~/.claude/settings.json` (backed up first), writes the role files, and appends a delegation policy to `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`.
@@ -59,7 +63,7 @@ What the clients end up with:
 
 | Command | Purpose |
 |---|---|
-| `install [--codex] [--claude] [--port N] [--pro]` | Configure detected clients, store the key, start the service. `--pro` puts `reviewer` and `senior` on DeepSeek V4 Pro. |
+| `install [--codex] [--claude] [--port N] [--pro] [--openrouter-key K]` | Configure detected clients, store the keys, start the service. `--pro` puts `reviewer` and `senior` on DeepSeek V4 Pro. |
 | `doctor` | Check service, port, client config, subscription auth, DeepSeek key, upstream reachability, versions. |
 | `test` | Spawn a real explorer in each client and prove from the router log that it ran on DeepSeek. |
 | `status` | Routes, failover state, per-model and per-role tokens, cache hit ratio, estimated spend. Also at http://127.0.0.1:4141/switchboard/ |

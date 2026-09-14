@@ -1,6 +1,8 @@
 // The loopback router: one HTTP server, three route families, no state beyond counters.
 import http from 'node:http';
-import { deepseekEntries, catalogHash } from './catalog.js';
+import { entriesFor, catalogHash } from './catalog.js';
+import { buildProviders } from './providers.js';
+import { createProvenance } from './provenance.js';
 import { sendJson } from './proxy.js';
 import { createStats } from './stats.js';
 import { renderStatusPage } from './status-page.js';
@@ -12,30 +14,31 @@ import { CODEX_PREFIX, CLAUDE_PREFIX } from './routes/shared.js';
  * @typedef {object} RouteContext
  * @property {URL} openai      upstream for Codex traffic (ChatGPT backend)
  * @property {URL} anthropic   upstream for Claude Code traffic
- * @property {URL} deepseek    DeepSeek API root
- * @property {{entries: object[], slugs: string[], hash: string}} catalog  injected model entries
+ * @property {import('./providers.js').Provider[]} providers  third-party providers, in routing order
+ * @property {{entries: object[], slugs: string[], hash: string}} catalog  entries injected into the Codex picker
  * @property {ReturnType<typeof createStats>} stats
- * @property {() => Promise<string|null>} deepseekKey
+ * @property {ReturnType<typeof createProvenance>} provenance  which provider produced which reasoning item
  * @property {(line: string) => void} log
  */
 
 /**
  * @param {object} opts
  * @param {object} opts.config      loaded switchboard config
- * @param {() => Promise<string|null>} opts.deepseekKey
+ * @param {(section: object) => Promise<string|null>} opts.keyFor  resolves an upstream section's API key
  * @param {string} [opts.logFile]   JSONL request log
  * @param {(line: string) => void} [opts.log]
  */
-export function createServer({ config, deepseekKey, logFile, log = () => {} }) {
-  const entries = deepseekEntries(config.upstream.deepseek.models);
+export function createServer({ config, keyFor, logFile, log = () => {} }) {
+  const providers = buildProviders(config, keyFor);
+  const entries = entriesFor(providers);
   /** @type {RouteContext} */
   const ctx = {
     openai: new URL(config.upstream.openai.base_url),
     anthropic: new URL(config.upstream.anthropic.base_url),
-    deepseek: new URL(config.upstream.deepseek.base_url),
+    providers,
     catalog: { entries, slugs: entries.map((e) => e.slug), hash: catalogHash(entries) },
     stats: createStats({ logFile }),
-    deepseekKey,
+    provenance: createProvenance(),
     log,
   };
   const codex = codexRoutes(ctx);
@@ -46,6 +49,7 @@ export function createServer({ config, deepseekKey, logFile, log = () => {} }) {
       name: 'agents-switchboard',
       listen: config.listen,
       routes: { codex: `${CODEX_PREFIX}/*`, claude: `${CLAUDE_PREFIX}/*` },
+      providers: Object.fromEntries(providers.map((p) => [p.name, { models: p.models, base_url: p.baseUrl.origin }])),
       deepseekModels: ctx.catalog.slugs,
       failover: { enabled: !!config.failover?.enabled, model: config.failover?.model ?? null, active: null },
       ...ctx.stats.snapshot(),

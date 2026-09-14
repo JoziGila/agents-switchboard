@@ -35,7 +35,8 @@ export function createStats({ logFile } = {}) {
     if (model) {
       const m = (models[model] ??= { requests: 0, input: 0, cached: 0, output: 0, usd: 0 });
       m.requests++;
-      if (usage) { m.input += usage.input; m.cached += usage.cached; m.output += usage.output; m.usd += estimateUsd(model, usage); }
+      // A provider-reported cost (OpenRouter's usage.cost) beats the bundled price table.
+      if (usage) { m.input += usage.input; m.cached += usage.cached; m.output += usage.output; m.usd += usage.usd ?? estimateUsd(model, usage); }
     }
     if (role) {
       const r = (roles[role] ??= { requests: 0, input: 0, cached: 0 });

@@ -46,17 +46,20 @@ export function parseArgs(args) {
 }
 
 async function serve(opts) {
-  const { loadConfig, resolveDeepSeekKey, listenAddress } = await import('./config.js');
+  const { loadConfig, resolveProviderKey, listenAddress, PROVIDER_KEY_ENV } = await import('./config.js');
   const { resolvePaths } = await import('./paths.js');
   const paths = resolvePaths();
   const config = loadConfig(paths);
   if (opts.port) config.listen = `127.0.0.1:${opts.port}`;
   const { host, port } = listenAddress(config);
   if (host !== '127.0.0.1' && host !== 'localhost' && !opts['allow-remote']) throw new Error(`refusing to listen on ${host} without --allow-remote`);
-  let cachedKey = null;
-  const deepseekKey = async () => (cachedKey ??= await resolveDeepSeekKey(config));
+  const cache = new Map();
+  const keyFor = async (section) => {
+    if (!cache.has(section)) cache.set(section, await resolveProviderKey(section, PROVIDER_KEY_ENV[section === config.upstream.openrouter ? 'openrouter' : 'deepseek']));
+    return cache.get(section);
+  };
   const log = (line) => process.stderr.write(`[switchboard] ${new Date().toISOString()} ${line}\n`);
-  const server = createServer({ config, deepseekKey, logFile: paths.logFile, log });
+  const server = createServer({ config, keyFor, logFile: paths.logFile, log });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); });
   log(`listening on http://${host}:${server.address().port} (codex: /backend-api/codex, claude: /anthropic, status: /switchboard/)`);
   await new Promise((resolve) => { for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => server.close(resolve)); });

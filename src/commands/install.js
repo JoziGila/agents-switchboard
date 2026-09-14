@@ -7,9 +7,10 @@ import { fileURLToPath } from 'node:url';
 import { runInstall, runUninstall, detectClients } from '../install/index.js';
 import { installService, uninstallService } from '../install/service.js';
 import { resolvePaths } from '../paths.js';
-import { loadConfig, saveConfig, listenAddress, resolveDeepSeekKey } from '../config.js';
+import { loadConfig, saveConfig, listenAddress, resolveProviderKey, PROVIDER_KEY_ENV } from '../config.js';
 import { setSecret, deleteSecret, keychainAvailable } from '../secrets.js';
-import { probeDeepSeek } from '../adapters/probe.js';
+import { probeProvider } from '../adapters/probe.js';
+import { buildProviders } from '../providers.js';
 import { baseUrlFor as codexUrl } from '../install/codex.js';
 import { baseUrlFor as claudeUrl } from '../install/claude.js';
 
@@ -56,6 +57,28 @@ async function verifyClient(client, port) {
   return { ok: r.code === 0 && /\bOK\b/.test(r.output), output: r.output };
 }
 
+/**
+ * DeepSeek is required for the default roles; OpenRouter is optional. Each key comes from a flag, the
+ * env, an existing keychain entry, or a hidden prompt, and is probed on both dialects before use.
+ */
+async function collectProviderKeys(cfg, opts) {
+  const result = { store: {}, abort: false };
+  const providers = buildProviders(cfg, async () => null);
+  for (const provider of providers) {
+    const name = provider.name;
+    const section = cfg.upstream[name];
+    const existing = await resolveProviderKey(section, PROVIDER_KEY_ENV[name]);
+    let key = opts[`${name}-key`] || (name === 'deepseek' ? opts.key : undefined) || process.env[PROVIDER_KEY_ENV[name]] || existing;
+    if (!key && !opts['dry-run']) key = await askHidden(`${name === 'deepseek' ? 'DeepSeek' : 'OpenRouter'} API key (${name === 'deepseek' ? 'platform.deepseek.com' : 'openrouter.ai/keys, optional'}; hidden; leave empty to skip): `);
+    if (!key) { out(`${name}: no key${name === 'deepseek' ? '; DeepSeek-bound requests will fail with a clear message until you add one' : '; OpenRouter routing stays available once you add one'}.`); continue; }
+    const probe = await probeProvider(provider, key);
+    out(`${name}: responses ${probe.responses.ok ? 'ok' : `FAILED (${probe.responses.error})`} · messages ${probe.messages.ok ? 'ok' : `FAILED (${probe.messages.error})`}`);
+    if (!probe.responses.ok && !probe.messages.ok && !opts.force) { out(`${name} key rejected on both dialects; not installing. Fix the key or pass --force.`); result.abort = true; }
+    if (key !== existing) result.store[name] = key;
+  }
+  return result;
+}
+
 export async function install(opts) {
   const paths = resolvePaths();
   const detected = await detectClients(paths);
@@ -64,26 +87,22 @@ export async function install(opts) {
   out(`Codex: ${detected.codex.present ? `found${detected.codex.version ? ` (${detected.codex.version})` : ''}` : 'not found'}   Claude Code: ${detected.claude.present ? `found${detected.claude.version ? ` (${detected.claude.version})` : ''}` : 'not found'}`);
   if (!wantCodex && !wantClaude) { out('Neither client detected. Install Codex or Claude Code first, or pass --codex / --claude.'); return 1; }
 
-  // 1. Switchboard config and key. Nothing client-facing is touched yet.
+  // 1. Switchboard config and provider keys. Nothing client-facing is touched yet.
   const cfg = loadConfig(paths);
   if (opts.port) cfg.listen = `127.0.0.1:${Number(opts.port)}`;
   const { host, port } = listenAddress(cfg);
-  let key = opts.key || process.env.DEEPSEEK_API_KEY || (await resolveDeepSeekKey(cfg));
-  if (!key && !opts['dry-run']) key = await askHidden('DeepSeek API key (from platform.deepseek.com, hidden; leave empty to add later): ');
-  if (key) {
-    const probe = await probeDeepSeek(key, cfg.upstream.deepseek.base_url);
-    out(`DeepSeek: responses ${probe.responses.ok ? 'ok' : `FAILED (${probe.responses.error})`} · messages ${probe.messages.ok ? 'ok' : `FAILED (${probe.messages.error})`}`);
-    if (!probe.responses.ok && !probe.messages.ok && !opts.force) { out('Key rejected on both dialects; not installing. Re-run with --force to install anyway.'); return 1; }
-  } else out('No DeepSeek key yet: DeepSeek-bound requests will fail with a clear message until you run `switchboard install` again with a key.');
+  const keys = await collectProviderKeys(cfg, opts);
   if (opts['dry-run']) {
     const report = await runInstall({ codex: wantCodex, claude: wantClaude, port, pro: !!opts.pro, dryRun: true, paths });
     for (const c of ['codex', 'claude']) if (report[c]) out(`${c}: ${summarize(report[c])}`);
     out('dry run: nothing written.'); return 0;
   }
+  if (keys.abort) return 1;
   saveConfig(cfg, paths);
-  if (key && key !== (await resolveDeepSeekKey(cfg))) {
-    if (keychainAvailable() && cfg.upstream.deepseek.api_key?.keychain) { await setSecret(cfg.upstream.deepseek.api_key.keychain, key); out('DeepSeek key stored in the OS keychain.'); }
-    else out(`warning: no OS keychain; put DEEPSEEK_API_KEY in the service environment and set api_key = { env = "DEEPSEEK_API_KEY" } in ${paths.configFile}`);
+  for (const [name, key] of Object.entries(keys.store)) {
+    const section = cfg.upstream[name];
+    if (keychainAvailable() && section.api_key?.keychain) { await setSecret(section.api_key.keychain, key); out(`${name} key stored in the OS keychain.`); }
+    else out(`warning: no OS keychain; put ${PROVIDER_KEY_ENV[name]} in the service environment and set api_key = { env = "${PROVIDER_KEY_ENV[name]}" } under [upstream.${name}] in ${paths.configFile}`);
   }
 
   // 2. The router must be running and healthy before any client is pointed at it.

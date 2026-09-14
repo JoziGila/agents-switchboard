@@ -111,3 +111,115 @@ test('catalog helpers', () => {
   assert.equal(rewriteEtag('"abc"', 'h1'), '"abc+sbh1"');
   assert.equal(rewriteEtag(undefined, 'h1'), '"sbh1"');
 });
+
+// ---- provider profiles and DeepSeek-harness rules ----
+import { DEEPSEEK_RESPONSES, OPENROUTER_RESPONSES, mapEffort, mapUpstreamError, reasoningIdsFromEvent, EMPTY_OUTPUT_PLACEHOLDER } from '../src/adapters/responses.js';
+import { DEEPSEEK_MESSAGES, OPENROUTER_MESSAGES } from '../src/adapters/messages.js';
+
+const frozen = (o) => JSON.parse(JSON.stringify(o));
+
+test('effort ladders: three-level and four-level mapping', () => {
+  const three = ['low', 'high', 'max'], four = ['minimal', 'low', 'medium', 'high'];
+  for (const [from, to] of [['minimal', 'low'], ['none', 'low'], ['low', 'low'], ['medium', 'high'], ['high', 'high'], ['xhigh', 'max'], ['max', 'max'], ['ultra', 'max'], ['weird', 'high']]) assert.equal(mapEffort(from, three), to, `3-level ${from}`);
+  for (const [from, to] of [['none', 'minimal'], ['minimal', 'minimal'], ['low', 'low'], ['medium', 'medium'], ['high', 'high'], ['xhigh', 'high'], ['max', 'high'], ['ultra', 'high'], ['weird', 'high']]) assert.equal(mapEffort(from, four), to, `4-level ${from}`);
+  assert.equal(mapEffort('xhigh', null), 'xhigh', 'null ladder passes through');
+});
+
+test('responses: openrouter profile keeps 4-level efforts, drops custom tools, keeps empty output', () => {
+  const body = { model: 'qwen/qwen3-coder[1m]', reasoning: { effort: 'xhigh' }, tools: [{ type: 'custom', name: 'apply_patch' }, { type: 'function', name: 'f' }], input: [{ type: 'function_call_output', call_id: 'c', output: '' }] };
+  const out = rewriteResponsesRequest(body, OPENROUTER_RESPONSES);
+  assert.equal(out.model, 'qwen/qwen3-coder');
+  assert.equal(out.reasoning.effort, 'high');
+  assert.deepEqual(out.tools.map((t) => t.name), ['f']);
+  assert.equal(out.input[0].output, '', 'no placeholder on openrouter');
+  const ds = rewriteResponsesRequest(body, DEEPSEEK_RESPONSES);
+  assert.equal(ds.reasoning.effort, 'max');
+  assert.deepEqual(ds.tools.map((t) => t.name), ['apply_patch', 'f']);
+  assert.equal(ds.input[0].output, EMPTY_OUTPUT_PLACEHOLDER);
+});
+
+test('responses: assistant content is never empty; empty tool output gets the placeholder (deepseek)', () => {
+  const body = { input: [
+    { type: 'message', role: 'assistant', content: [] },
+    { type: 'message', role: 'assistant' },
+    { type: 'message', role: 'user', content: [] },
+    { type: 'function_call_output', call_id: 'c1', output: [] },
+    { type: 'function_call_output', call_id: 'c2', output: 'real' },
+  ] };
+  const out = rewriteResponsesRequest(frozen(body));
+  assert.deepEqual(out.input[0].content, [{ type: 'output_text', text: '' }]);
+  assert.deepEqual(out.input[1].content, [{ type: 'output_text', text: '' }]);
+  assert.deepEqual(out.input[2].content, [], 'user messages untouched');
+  assert.equal(out.input[3].output, EMPTY_OUTPUT_PLACEHOLDER);
+  assert.equal(out.input[4].output, 'real');
+  assert.deepEqual(rewriteResponsesRequest(out), out, 'idempotent');
+});
+
+test('responses: encrypted_content kept only when the profile vouches for the item', () => {
+  const body = { input: [
+    { type: 'reasoning', id: 'rs_ours', encrypted_content: 'E1', summary: [] },
+    { type: 'reasoning', id: 'rs_foreign', encrypted_content: 'E2', summary: [] },
+    { type: 'reasoning', id: 'rs_text', encrypted_content: 'E3', summary: [{ type: 'summary_text', text: 'kept text' }] },
+  ] };
+  const profile = { ...OPENROUTER_RESPONSES, keepEncryptedContent: (i) => i.id === 'rs_ours' };
+  const out = rewriteResponsesRequest(frozen(body), profile);
+  assert.deepEqual(out.input.map((i) => i.id), ['rs_ours', 'rs_text']);
+  assert.equal(out.input[0].encrypted_content, 'E1');
+  assert.ok(!('encrypted_content' in out.input[1]));
+  assert.equal(out.input[1].summary[0].text, 'kept text', 'reasoning text replayed byte-exact');
+  assert.equal(body.input[1].encrypted_content, 'E2', 'input not mutated');
+});
+
+test('messages: openrouter profile passes adaptive thinking, structured output, efforts and documents', () => {
+  const body = { model: 'anthropic/claude-sonnet-5[1m]', thinking: { type: 'adaptive', display: 'omitted' }, output_config: { effort: 'xhigh', format: { type: 'json_schema' } },
+    messages: [{ role: 'user', content: [{ type: 'document', source: {} }, { type: 'text', text: 'q' }] }, { role: 'system', content: [{ type: 'text', text: 'mid' }] }] };
+  const { body: out, notes } = rewriteMessagesRequest(frozen(body), OPENROUTER_MESSAGES);
+  assert.equal(out.model, 'anthropic/claude-sonnet-5');
+  assert.deepEqual(out.thinking, { type: 'adaptive' }, 'display dropped, adaptive kept');
+  assert.deepEqual(out.output_config, { effort: 'xhigh', format: { type: 'json_schema' } });
+  assert.equal(out.messages[0].content.length, 2, 'documents kept');
+  assert.equal(out.messages[1].role, 'user', 'mid-conversation system still converted');
+  assert.deepEqual(notes, ['system-role→user']);
+});
+
+test('messages: deepseek profile maps efforts and fills empty assistant content and tool results', () => {
+  const body = { model: 'deepseek-flash', output_config: { effort: 'medium' }, messages: [
+    { role: 'assistant', content: [] },
+    { role: 'assistant', content: 'fine' },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: [] }, { type: 'tool_result', tool_use_id: 't2', content: 'x' }] },
+  ] };
+  const { body: out } = rewriteMessagesRequest(frozen(body));
+  assert.deepEqual(out.output_config, { effort: 'high' });
+  assert.equal(out.messages[0].content, '');
+  assert.equal(out.messages[1].content, 'fine');
+  assert.equal(out.messages[2].content[0].content, EMPTY_OUTPUT_PLACEHOLDER);
+  assert.equal(out.messages[2].content[1].content, 'x');
+  assert.deepEqual(rewriteMessagesRequest(out).body, out, 'idempotent');
+  const or = rewriteMessagesRequest(frozen(body), OPENROUTER_MESSAGES).body;
+  assert.equal(or.output_config.effort, 'medium', 'null ladder passes through');
+  assert.deepEqual(or.messages[2].content[0].content, [], 'no placeholder on openrouter');
+});
+
+test('error mapping never emits 401/402/403 and parses the OpenRouter envelope', () => {
+  for (const s of [401, 402, 403]) {
+    const m = mapUpstreamError(s, '{"error":{"message":"nope"}}', 'openrouter');
+    assert.equal(m.status, 400, `${s} → 400`);
+    assert.match(m.body.error.message, /^openrouter: nope \(check the openrouter API key or credits\)$/);
+  }
+  const or = mapUpstreamError(429, JSON.stringify({ error: { code: 429, message: 'Rate limit exceeded', metadata: { error_type: 'rate_limit_exceeded', provider_name: 'DeepSeek' } } }), 'openrouter');
+  assert.equal(or.status, 429);
+  assert.equal(or.body.error.type, 'rate_limit_exceeded');
+  assert.equal(or.body.error.message, 'openrouter: Rate limit exceeded [rate_limit_exceeded, provider DeepSeek]');
+  assert.equal(mapUpstreamError(503, 'down').body.error.type, 'server_error');
+  assert.equal(mapUpstreamError(400, 'bad').status, 400);
+  assert.equal(mapDeepSeekError(401, 'x').status, 400, 'alias still works');
+});
+
+test('usage cost and reasoning ids from events', () => {
+  const done = { type: 'response.completed', response: { usage: { input_tokens: 10, output_tokens: 2, cost: 0.0012 }, output: [{ type: 'reasoning', id: 'rs_1' }, { type: 'message', id: 'm' }, { type: 'reasoning', id: 'rs_2' }] } };
+  assert.deepEqual(usageFromResponsesEvent(done), { input: 10, cached: 0, output: 2, usd: 0.0012 });
+  assert.deepEqual(reasoningIdsFromEvent(done), ['rs_1', 'rs_2']);
+  assert.deepEqual(reasoningIdsFromEvent({ type: 'response.output_item.done', item: { type: 'reasoning', id: 'rs_9' } }), ['rs_9']);
+  assert.deepEqual(reasoningIdsFromEvent({ type: 'response.output_item.done', item: { type: 'message', id: 'm' } }), []);
+  assert.deepEqual(reasoningIdsFromEvent({ type: 'ping' }), []);
+});

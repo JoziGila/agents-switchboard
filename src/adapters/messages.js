@@ -1,44 +1,87 @@
-// Anthropic Messages adapter for DeepSeek (Claude Code traffic). Pure functions; see SPEC §6.2.
+// Anthropic Messages adapter (Claude Code traffic) for DeepSeek and OpenRouter. Pure functions; see SPEC §6.2 and docs/deepseek-standard.md.
 import { baseModelId } from '../catalog.js';
+import { mapEffort, EMPTY_OUTPUT_PLACEHOLDER } from './responses.js';
 
-const UNSUPPORTED_BLOCKS = new Set(['document', 'search_result', 'redacted_thinking']);
+/**
+ * @typedef {object} MessagesProfile
+ * @property {string} name
+ * @property {boolean} adaptiveThinking        provider accepts `thinking.type = "adaptive"`
+ * @property {boolean} structuredOutput        provider accepts `output_config.format`
+ * @property {boolean} midConversationSystem   provider accepts `role: "system"` inside messages
+ * @property {string[]} unsupportedBlocks      content block types to drop
+ * @property {string[]|null} effortLevels      effort ladder for `output_config.effort`, or null to pass through
+ * @property {boolean} placeholderEmptyOutput  replace empty tool results with a placeholder
+ */
 
-function cleanMessage(m, notes) {
+/** @type {MessagesProfile} */
+export const DEEPSEEK_MESSAGES = { name: 'deepseek', adaptiveThinking: false, structuredOutput: false, midConversationSystem: false, unsupportedBlocks: ['document', 'search_result', 'redacted_thinking'], effortLevels: ['low', 'high', 'max'], placeholderEmptyOutput: true };
+/** @type {MessagesProfile} */
+export const OPENROUTER_MESSAGES = { name: 'openrouter', adaptiveThinking: true, structuredOutput: true, midConversationSystem: false, unsupportedBlocks: [], effortLevels: null, placeholderEmptyOutput: false };
+
+/** Harness rule: empty tool output still needs some content on the wire. */
+function ensureToolResult(block) {
+  if (block?.type !== 'tool_result') return block;
+  const c = block.content;
+  const empty = c == null || c === '' || (Array.isArray(c) && c.length === 0);
+  return empty ? { ...block, content: EMPTY_OUTPUT_PLACEHOLDER } : block;
+}
+
+/** Harness rule: assistant content is never null or empty; a bricked turn stays in the log forever. */
+function ensureAssistantContent(m) {
+  if (m.role !== 'assistant') return m;
+  const c = m.content;
+  const empty = c == null || c === '' || (Array.isArray(c) && c.length === 0);
+  return empty ? { ...m, content: '' } : m;
+}
+
+function cleanMessage(m, profile, notes) {
   if (!m || typeof m !== 'object') return m;
-  const out = { ...m };
-  if (out.role === 'system') { out.role = 'user'; notes.push('system-role→user'); }
+  let out = { ...m };
+  if (out.role === 'system' && !profile.midConversationSystem) { out.role = 'user'; notes.push('system-role→user'); }
   if (Array.isArray(out.content)) {
-    const kept = out.content.filter((b) => !(b && UNSUPPORTED_BLOCKS.has(b.type)));
+    const unsupported = new Set(profile.unsupportedBlocks);
+    const kept = out.content.filter((b) => !(b && unsupported.has(b.type)));
     if (kept.length !== out.content.length) notes.push(`dropped ${out.content.length - kept.length} unsupported block(s)`);
-    if (kept.length === 0) return null;
-    out.content = kept;
+    if (kept.length === 0 && out.role !== 'assistant') return null;
+    out.content = profile.placeholderEmptyOutput ? kept.map(ensureToolResult) : kept;
   }
-  return out;
+  return ensureAssistantContent(out);
+}
+
+/** Harness rule: `thinking` travels as `{type: enabled|disabled}`; `display` is client-only. */
+function cleanThinking(thinking, profile, notes) {
+  const { display: _d, ...t } = thinking;
+  if (t.type === 'adaptive' && !profile.adaptiveThinking) { t.type = 'enabled'; notes.push('thinking adaptive→enabled'); }
+  return t;
+}
+
+function cleanOutputConfig(oc, profile, notes) {
+  let out = { ...oc };
+  if ('format' in out && !profile.structuredOutput) { delete out.format; notes.push('dropped output_config.format'); }
+  if (out.effort && profile.effortLevels) out.effort = mapEffort(out.effort, profile.effortLevels);
+  return Object.keys(out).length ? out : undefined;
 }
 
 /**
- * Rewrite a Claude Code Messages request for DeepSeek's Anthropic-compatible endpoint.
+ * Rewrite a Claude Code Messages request for a provider's Anthropic-compatible endpoint.
+ * @param {object} body
+ * @param {MessagesProfile} [profile]
  * @returns {{ body: object, notes: string[] }}
  */
-export function rewriteMessagesRequest(body) {
+export function rewriteMessagesRequest(body, profile = DEEPSEEK_MESSAGES) {
   const notes = [];
   const out = { ...body, model: baseModelId(body.model) };
-  if (out.thinking && typeof out.thinking === 'object') {
-    const { display: _d, ...t } = out.thinking;
-    if (t.type === 'adaptive') { t.type = 'enabled'; notes.push('thinking adaptive→enabled'); }
-    out.thinking = t;
-  }
-  if (Array.isArray(out.messages)) out.messages = out.messages.map((m) => cleanMessage(m, notes)).filter(Boolean);
-  if (out.output_config && typeof out.output_config === 'object' && 'format' in out.output_config) {
-    const { format: _f, ...oc } = out.output_config;
-    notes.push('dropped output_config.format');
-    if (Object.keys(oc).length) out.output_config = oc; else delete out.output_config;
+  if (out.thinking && typeof out.thinking === 'object') out.thinking = cleanThinking(out.thinking, profile, notes);
+  if (Array.isArray(out.messages)) out.messages = out.messages.map((m) => cleanMessage(m, profile, notes)).filter(Boolean);
+  if (out.output_config && typeof out.output_config === 'object') {
+    const oc = cleanOutputConfig(out.output_config, profile, notes);
+    if (oc) out.output_config = oc; else delete out.output_config;
   }
   out.stream = true;
   return { body: out, notes };
 }
 
-/** True when any assistant message carries a thinking block without a signature (DeepSeek-originated). */
+/** True when any assistant message carries a thinking block without a signature (not Anthropic-originated). */
 export function hasUnsignedThinking(body) {
   for (const m of body?.messages ?? []) {
     if (m?.role !== 'assistant' || !Array.isArray(m.content)) continue;
@@ -77,9 +120,11 @@ export function normalizeSseData(data) {
   } catch { return data; }
 }
 
-/** Token counts from a final `message_delta` / `message_start` payload. */
+/** Token counts (and OpenRouter's `cost`) from a `message_delta` / `message_start` payload. */
 export function usageFromMessagesEvent(j) {
   const u = j?.usage ?? j?.message?.usage;
   if (!u) return null;
-  return { input: u.input_tokens ?? 0, cached: u.cache_read_input_tokens ?? u.prompt_cache_hit_tokens ?? 0, output: u.output_tokens ?? 0 };
+  const usage = { input: u.input_tokens ?? 0, cached: u.cache_read_input_tokens ?? u.prompt_cache_hit_tokens ?? 0, output: u.output_tokens ?? 0 };
+  if (typeof u.cost === 'number') usage.usd = u.cost;
+  return usage;
 }

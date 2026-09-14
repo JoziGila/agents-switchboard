@@ -22,6 +22,53 @@ export function deepseekEntries(slugs) {
   return bundled.models.filter((m) => wanted.has(m.slug));
 }
 
+/**
+ * A picker entry for a model a provider serves but ships no catalog for (OpenRouter ids). Derived from
+ * DeepSeek's Flash entry: plain function tools, function-style apply_patch, no responses-lite, no code mode.
+ * Per-model `overrides` (context_window, display_name, supported_reasoning_levels, ...) win.
+ */
+export function genericEntry(slug, providerName, overrides = {}) {
+  const base = bundled.models.find((m) => m.slug === 'deepseek-flash');
+  const { base_instructions: _b, model_messages: _m, ...template } = base;
+  const vendor = slug.replace(/^~/, '').split('/')[0];
+  return {
+    ...template,
+    slug,
+    display_name: overrides.display_name ?? slug.replace(/^~/, '').split('/').pop(),
+    description: overrides.description ?? `${vendor} model via ${providerName}`,
+    apply_patch_tool_type: 'function',
+    input_modalities: ['text'],
+    supports_search_tool: false,
+    context_window: 262_144,
+    max_context_window: 262_144,
+    default_reasoning_level: 'medium',
+    supported_reasoning_levels: [
+      { effort: 'low', description: 'Fast responses with lighter reasoning' },
+      { effort: 'medium', description: 'Balanced reasoning for everyday tasks' },
+      { effort: 'high', description: 'Greater reasoning depth for complex problems' },
+    ],
+    priority: 9,
+    ...overrides,
+  };
+}
+
+/**
+ * All entries to inject into the Codex picker for the configured providers: DeepSeek's bundled entries
+ * for its slugs, generic entries for everything else.
+ * @param {import('./providers.js').Provider[]} providers
+ */
+export function entriesFor(providers) {
+  const out = [];
+  for (const p of providers) {
+    for (const slug of p.models) {
+      const bundledEntry = bundled.models.find((m) => m.slug === slug);
+      const entry = bundledEntry ?? genericEntry(slug, p.name, p.modelOverrides[slug]);
+      out.push(p.modelOverrides[slug] && bundledEntry ? { ...entry, ...p.modelOverrides[slug] } : entry);
+    }
+  }
+  return out;
+}
+
 /** Short stable hash of the injected entries, used to fork the upstream ETag. */
 export function catalogHash(entries) {
   return createHash('sha256').update(JSON.stringify(entries)).digest('hex').slice(0, 8);
