@@ -158,13 +158,13 @@ DeepSeek Responses API: only `function` tools plus the `apply_patch` custom tool
 Request rewrite:
 
 1. `include`: remove `reasoning.encrypted_content`; drop the key if empty.
-2. `input`: delete `encrypted_content` from every `reasoning` item; remove items left empty. Relevant when a child is spawned with `fork_turns` from a GPT parent.
+2. `input`: delete `encrypted_content` from every `reasoning` item; remove items left empty. Relevant when a child is spawned with `fork_turns` from a GPT parent. Reasoning text that DeepSeek itself returned is never touched: DeepSeek recovers a turn's thinking signature by hashing that exact text, and its own harness replays it on every turn for that reason (docs/research/deepseek-harness-learnings.md).
 3. `tools`: keep `function` and the `apply_patch` custom tool. Flatten `namespace` wrappers into their members. Remove `web_search`, `image_generation`.
 4. Remove `store`, `prompt_cache_key`, `service_tier`, `safety_identifier`, `text.verbosity`. DeepSeek would ignore them; removing keeps the body identical across requests.
 5. `reasoning.effort`: pass low, high, max; map medium → high, xhigh → max, ultra → max.
 6. Everything else (`instructions`, `input` order, `parallel_tool_calls`, `stream`) untouched.
 
-Response: SSE forwarded unchanged. The switchboard reads `usage` from `response.completed` for its counters and maps DeepSeek HTTP errors to the OpenAI envelope Codex expects (401 → `invalid_api_key`, 429 → `rate_limit_exceeded`, 5xx → `server_error`) so Codex's retry logic behaves normally.
+Response: SSE forwarded unchanged. The switchboard reads `usage` from `response.completed` for its counters, preferring the OpenAI-compatible `input_tokens_details.cached_tokens` and falling back to DeepSeek's `prompt_cache_hit_tokens`, and remembering that DeepSeek's prompt totals include cache hits, and maps DeepSeek HTTP errors to the OpenAI envelope Codex expects (401 → `invalid_api_key`, 429 → `rate_limit_exceeded`, 5xx → `server_error`) so Codex's retry logic behaves normally.
 
 ### 6.2 Messages adapter (Claude Code)
 
@@ -174,7 +174,7 @@ Request rewrite:
 
 1. `model`: strip a `[1m]` suffix (Claude Code normally strips it itself).
 2. `thinking`: `{"type": "adaptive"}` becomes `{"type": "enabled"}`. Claude Code sends adaptive for every model it does not recognise.
-3. `system` array and `messages` forwarded unchanged, including the attribution block (stable per conversation since Claude Code 2.1.181) and `cache_control` markers. Nothing is reordered or merged.
+3. `system` array and `messages` forwarded unchanged, including the attribution block (stable per conversation since Claude Code 2.1.181), `cache_control` markers, and every `thinking` block DeepSeek previously returned. Nothing is reordered or merged.
 4. Content blocks DeepSeek rejects (`document`, `search_result`, `redacted_thinking`) are dropped from `messages` with a log line. Text and tool blocks are never touched.
 5. `context_management`, `tool` beta fields (`strict`, `defer_loading`), `metadata` other than `user_id`: left in place. DeepSeek ignores unknown fields.
 
@@ -234,7 +234,11 @@ Both clients already send cache-shaped requests: a fixed system prompt or `instr
 3. **Volatile bytes never reach DeepSeek.** `prompt_cache_key`, `session_id`, `x-codex-*`, `x-claude-code-*`, `anthropic-beta` are stripped. Claude Code's attribution block is stable per conversation since 2.1.181, so it is left in place (moving it would defeat Anthropic's positional strip on the Claude path).
 4. **Forks inherit the parent's cache.** A child spawned with `fork_turns` from a DeepSeek parent replays a prefix DeepSeek already holds. From a frontier parent only the instructions prefix is shared, which is still most of a short exploration.
 5. **Compaction is the one legitimate miss.** Both clients rewrite history when they compact; the switchboard counts those as expected rebuilds, the same way Claude Code's own `/usage` cache line does.
-6. **Measure per role.** Hit ratio per client, model and role is on the status page. Below 60% on explorer traffic is a bug to investigate: the usual causes are a role file changing the base prompt, tool definitions changing between requests, or aggressive context editing.
+6. **Keep the catalog small and still.** Codex renders the available model list into the `spawn_agent` tool description, which sits in every request's prefix. The switchboard injects two entries and never varies them at runtime; adding models is a release, not a setting. DeepSeek's own harness refuses to render its catalog into tool schemas for the same reason.
+7. **Replay reasoning exactly.** Reasoning text DeepSeek returned is sent back byte-identical on every later request, on both dialects. It sits at a fixed position, so it costs one miss when it first appears and hits forever after.
+8. **Measure per role.** Hit ratio per client, model and role is on the status page. Below 60% on explorer traffic is a bug to investigate: the usual causes are a role file changing the base prompt, tool definitions changing between requests, or aggressive context editing.
+
+These rules are the ones DeepSeek applies in its own harness, where every model-visible addition must document its "KV cache effect" and anything volatile goes into a tail message that is re-emitted only when it changes. The reference notes are in `docs/research/deepseek-harness-learnings.md`.
 
 Cache hygiene the installer applies only if the keys are absent: keep default compaction thresholds; for Claude Code leave `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` unset (the extra fields are ignored by DeepSeek and needed by Claude); for Codex leave `context_management.experimental_mode` at its current value but warn if it is on, since it rewrites history more often.
 
@@ -438,7 +442,7 @@ model = "deepseek-flash"
 | Phase | Delivers |
 |---|---|
 | 1 | Router with both pass-throughs, both DeepSeek adapters, Codex catalog injection, WebSocket decline, ping insurance, installer for both clients, roles, delegation policy, doctor, test, status. DeepSeek subagents everywhere; DeepSeek as main model by picker. |
-| 2 | Quota failover for Claude Code and for function-tool GPT models. Captured 429 fixtures. Cost and cache dashboards. Local compaction shim for DeepSeek main sessions in Codex. |
+| 2 | Quota failover for Claude Code and for function-tool GPT models. Captured 429 fixtures. Cost and cache dashboards. Local compaction shim for DeepSeek main sessions in Codex, built as a prefix extension of the last request (same instructions, tools and history, directive appended last) so the summary call itself is mostly cache hits, the way DeepSeek's harness does it. |
 | 3 | WebSocket splice for GPT traffic. Responses-lite reshaping for GPT‑6 Astra failover. Codex multi-agent v2 verification. |
 | 4 | Any Responses- or Messages-compatible upstream as a subagent provider; per-role cost budgets. |
 
@@ -495,3 +499,16 @@ model = "deepseek-flash"
 - Anthropic API: `thinking` supported (`budget_tokens` ignored), `output_config.effort` supported, `cache_control` and beta headers ignored, `document`/`search_result`/`redacted_thinking` unsupported.
 - Pricing per 1M tokens, off-peak / peak: Flash input miss 0.15 / 0.30, hit 0.003 / 0.006, output 0.60 / 1.20. V4 Pro input miss 0.66 / 1.32, hit 0.022 / 0.044, output 1.98 / 3.96. Peak is 01:00–04:00 and 06:00–10:00 UTC on weekdays.
 - Cache: exact-prefix units, persisted at request boundaries and fixed intervals, shared across requests, expire after hours to days. Usage reports `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens`.
+
+## Appendix D. Practices copied from DeepSeek's harness
+
+DeepSeek's own agent harness (`deepseek-ai/deepseek-harness`) is the reference for how DeepSeek wants to be called. The switchboard adopts these, detailed in `docs/research/deepseek-harness-learnings.md`:
+
+- Its Codex integration is a loopback Responses-API shim in front of DeepSeek, and its Claude Code integration points `ANTHROPIC_BASE_URL` at `api.deepseek.com/anthropic`. The switchboard is the same shape, extended to keep the frontier models.
+- `thinking` is top-level; "no thinking" is `{type: "disabled"}` with `reasoning_effort` omitted; efforts are `low | high | max`. The Messages adapter's adaptive → enabled rule and the Responses adapter's effort mapping follow this.
+- `reasoning_content` and thinking blocks are replayed byte-exactly on every turn.
+- Assistant content is never `null`, empty tool output never empty. The adapters preserve whatever the clients send and add the placeholder only where a client would otherwise send nothing.
+- Cache accounting reads the OpenAI-compatible cached-token field first and DeepSeek's `prompt_cache_hit_tokens` second, and treats prompt totals as inclusive of hits.
+- `Retry-After` is honoured up to a cap; beyond it the request is failed rather than slept. An empty completion is retryable. Streams have a 300 s idle watchdog.
+- Nothing volatile enters the prefix; out-of-band data travels in headers (`x-deepseek-harness-*`) or namespaced body fields. The switchboard tags its own auxiliary calls the same way and never touches the prefix.
+- Compaction requests are prefix extensions of the last request, so summarising is cheap.
