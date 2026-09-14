@@ -199,7 +199,7 @@ Request rewrite:
 
 Response handling:
 
-- SSE forwarded unchanged (`message_start`, `content_block_*`, `message_delta`, `message_stop`, `ping`).
+- SSE forwarded unchanged (`message_start`, `content_block_*`, `message_delta`, `message_stop`, `ping`). On the Responses side, `response.completed.usage` is normalised to the OpenAI spellings (`total_tokens`, `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`) so Codex's context meter and compaction thresholds see the native shape.
 - Ping insurance: Claude Code aborts a stream silent for 300 s. If DeepSeek sends no bytes for 20 s, the switchboard emits `event: ping` itself.
 - Usage normalisation: if the final usage lacks `cache_read_input_tokens` but carries DeepSeek's `prompt_cache_hit_tokens`, the switchboard fills `cache_read_input_tokens` and `cache_creation_input_tokens: 0` so `/usage` shows the prompt-cache line and per-model figures for DeepSeek turns.
 - Error bodies forwarded unmodified. Claude Code matches on upstream error wording to decide its own recovery, and wrapping breaks that.
@@ -390,7 +390,7 @@ tools: Read, Grep, Glob, Bash
 You are an explorer. Answer the parent's question about the codebase with file paths and line references. Do not modify files. Do not speculate beyond what you read. Be brief.
 ```
 
-`worker` (model `deepseek-flash`, all tools), `reviewer` (model `deepseek-flash`, read-only tools) and `senior` (model `inherit`, so it runs on whatever frontier model the session uses) follow the same pattern with the instructions from §10.1. The built-in `Explore` and `Plan` agents already follow `CLAUDE_CODE_SUBAGENT_MODEL`, so they run on Flash without a file.
+`worker` (model `deepseek-flash[1m]`, all tools, `effort: high`), `reviewer` (read-only tools, `effort: high`) and `senior` (model `inherit`, so it runs on whatever frontier model the session uses) follow the same pattern with the instructions from §10.1. Claude Code's built-in `Explore` and `Plan` agents do not follow `CLAUDE_CODE_SUBAGENT_MODEL`: they inherit the main model. A user agent with the same name replaces the built-in and keeps its own model, so the installer also writes `Explore.md` (`effort: low`) and `Plan.md` (`effort: high`) on Flash. Claude reaches for Explore on its own many times per session, which makes this the largest single saving on the Claude side. The frontmatter `effort` flows through the Messages adapter onto DeepSeek's `low | high | max` ladder.
 
 ### 10.3 Delegation policy
 

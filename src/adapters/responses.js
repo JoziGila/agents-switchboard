@@ -175,3 +175,33 @@ export function reasoningIdsFromEvent(event) {
   if (event?.type === 'response.completed') return (event.response?.output ?? []).filter((i) => i?.type === 'reasoning' && i.id).map((i) => i.id);
   return [];
 }
+
+/**
+ * Codex reads `usage` from `response.completed` for its context meter and compaction thresholds.
+ * Fill the OpenAI spellings from DeepSeek's when they are missing so the shape is native.
+ */
+export function normalizeResponsesUsage(usage) {
+  if (!usage || typeof usage !== 'object') return usage;
+  const cached = usage.input_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens ?? 0;
+  const input = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+  const output = usage.output_tokens ?? usage.completion_tokens ?? 0;
+  const reasoning = usage.output_tokens_details?.reasoning_tokens ?? usage.completion_tokens_details?.reasoning_tokens ?? 0;
+  return {
+    ...usage,
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: usage.total_tokens ?? input + output,
+    input_tokens_details: { ...(usage.input_tokens_details ?? {}), cached_tokens: cached },
+    output_tokens_details: { ...(usage.output_tokens_details ?? {}), reasoning_tokens: reasoning },
+  };
+}
+
+/** Apply normalizeResponsesUsage to one SSE `data:` payload when it carries a response with usage. */
+export function normalizeResponsesSseData(data) {
+  if (!data.includes('"usage"')) return data;
+  try {
+    const j = JSON.parse(data);
+    if (j?.response?.usage) { j.response.usage = normalizeResponsesUsage(j.response.usage); return JSON.stringify(j); }
+    return data;
+  } catch { return data; }
+}

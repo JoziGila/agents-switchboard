@@ -4,7 +4,7 @@ import path from 'node:path';
 import { DEFAULT_PORT } from '../config.js';
 import { resolvePaths } from '../paths.js';
 import { backupFile, readTextOr, readState, writeState, writeRoleFiles, removeRoleFiles, upsertDelegationFile, removeDelegationFile } from './files.js';
-import { claudeRoles, renderClaudeRole, MANAGED_MD, ROLE_NAMES } from './roles.js';
+import { claudeRoles, renderClaudeRole, MANAGED_MD, CLAUDE_ROLE_NAMES } from './roles.js';
 
 /** The `modelSettings` entry the installer owns. */
 const MODEL_SETTINGS_KEY = 'deepseek-flash';
@@ -114,7 +114,7 @@ function readSettings(file) {
 
 const roleSpec = (claudeHome, pro) => ({
   dir: path.join(claudeHome, 'agents'), extension: '.md', marker: MANAGED_MD, afterFrontmatter: true,
-  roles: claudeRoles({ pro }), render: renderClaudeRole, names: ROLE_NAMES,
+  roles: claudeRoles({ pro }), render: renderClaudeRole, names: CLAUDE_ROLE_NAMES,
 });
 
 /**

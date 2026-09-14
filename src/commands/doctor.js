@@ -7,7 +7,7 @@ import { loadConfig, listenAddress, resolveProviderKey, PROVIDER_KEY_ENV } from 
 import { baseUrlFor as claudeUrl } from '../install/claude.js';
 import { baseUrlFor as codexUrl } from '../install/codex.js';
 import { detectClients } from '../install/index.js';
-import { ROLE_NAMES } from '../install/roles.js';
+import { ROLE_NAMES, CLAUDE_ROLE_NAMES } from '../install/roles.js';
 import { serviceStatus } from '../install/service.js';
 import { resolvePaths } from '../paths.js';
 
@@ -63,7 +63,7 @@ async function reachable(url, timeoutMs) {
   }
 }
 
-const roleFilesExist = (dir, extension) => ROLE_NAMES.every((name) => fs.existsSync(path.join(dir, `${name}${extension}`)));
+const roleFilesExist = (dir, extension, names = ROLE_NAMES) => names.every((name) => fs.existsSync(path.join(dir, `${name}${extension}`)));
 
 /**
  * Each check: `name` (string or function of ctx), `when` (optional gate), `run` returning a boolean or `{ ok, detail }`.
@@ -99,7 +99,7 @@ const CHECKS = [
   { name: 'claude ANTHROPIC_BASE_URL points at router', when: (c) => c.detected.claude.present, run: (c) => c.claudeSettings.env?.ANTHROPIC_BASE_URL === claudeUrl(c.port) },
   { name: 'claude subagent model set', when: (c) => c.detected.claude.present, run: (c) => /^deepseek-/.test(c.claudeSettings.env?.CLAUDE_CODE_SUBAGENT_MODEL ?? '') },
   { name: 'claude has no API-key credential (subscription stays active)', when: (c) => c.detected.claude.present, run: (c) => !c.claudeSettings.env?.ANTHROPIC_API_KEY && !c.claudeSettings.env?.ANTHROPIC_AUTH_TOKEN && !c.claudeSettings.apiKeyHelper && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN },
-  { name: 'claude role files', when: (c) => c.detected.claude.present, run: (c) => roleFilesExist(path.join(c.paths.claudeHome, 'agents'), '.md') },
+  { name: 'claude role files', when: (c) => c.detected.claude.present, run: (c) => roleFilesExist(path.join(c.paths.claudeHome, 'agents'), '.md', CLAUDE_ROLE_NAMES) },
 
   { name: 'chatgpt.com reachable', when: (c) => !c.opts.offline, run: (c) => reachable(c.cfg.upstream.openai.base_url, REACH_TIMEOUT_MS) },
   { name: 'api.anthropic.com reachable', when: (c) => !c.opts.offline, run: (c) => reachable(c.cfg.upstream.anthropic.base_url, REACH_TIMEOUT_MS) },

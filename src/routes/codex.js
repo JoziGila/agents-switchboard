@@ -1,7 +1,7 @@
 // Codex traffic: /backend-api/codex/*  (SPEC §4, §5.1, §6.1, §7)
 import { mergeModels, rewriteEtag } from '../catalog.js';
 import { resolveProvider, stripSuffix } from '../providers.js';
-import { rewriteResponsesRequest, mapUpstreamError, usageFromResponsesEvent, reasoningIdsFromEvent, DEEPSEEK_RESPONSES, OPENROUTER_RESPONSES } from '../adapters/responses.js';
+import { rewriteResponsesRequest, mapUpstreamError, usageFromResponsesEvent, reasoningIdsFromEvent, normalizeResponsesSseData, DEEPSEEK_RESPONSES, OPENROUTER_RESPONSES } from '../adapters/responses.js';
 import { readBody, decodeBody, sendJson, upstreamHeaders, upstreamRequest, relayResponse, passThrough, readResponse } from '../proxy.js';
 import { detectExhaustion, liftResponsesLite } from '../failover.js';
 import { createSseRelay } from '../sse.js';
@@ -47,7 +47,7 @@ export function codexRoutes(ctx) {
       return;
     }
     let usage = null;
-    const relay = createSseRelay({ onEvent: (j) => {
+    const relay = createSseRelay({ mapData: normalizeResponsesSseData, onEvent: (j) => {
       for (const id of reasoningIdsFromEvent(j)) provenance.remember(provider.name, id);
       if (j?.type === 'response.completed') usage = usageFromResponsesEvent(j);
     } });

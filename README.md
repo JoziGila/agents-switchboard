@@ -57,7 +57,7 @@ What the clients end up with:
 | `openai_base_url` → the router | `env.ANTHROPIC_BASE_URL` → the router |
 | `[agents] default_subagent_model = "deepseek-flash"` | `env.CLAUDE_CODE_SUBAGENT_MODEL = "deepseek-flash[1m]"` |
 | `[features] multi_agent_v2 = false` | `env.ANTHROPIC_CUSTOM_MODEL_OPTION*` (picker entry) |
-| `~/.codex/agents/{explorer,worker,reviewer,senior}.toml` | `~/.claude/agents/{explorer,worker,reviewer,senior}.md` |
+| `~/.codex/agents/{explorer,worker,reviewer,senior}.toml` | `~/.claude/agents/{explorer,worker,reviewer,senior,Explore,Plan}.md` (the last two replace Claude's built-ins, which otherwise ignore the subagent model) |
 
 ## Commands
 

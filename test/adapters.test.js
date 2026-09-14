@@ -238,3 +238,13 @@ test('codex agent_message items become plain user messages; encrypted payloads a
   assert.equal(out.input[1].type, 'message');
   assert.match(out.input[1].content[0].text, /encrypted by the vendor/);
 });
+
+test('responses usage is normalised to the native shape for Codex', () => {
+  const { normalizeResponsesSseData } = adaptersForAgentMessage;
+  const d = normalizeResponsesSseData('{"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":7,"prompt_cache_hit_tokens":90}}}');
+  const u = JSON.parse(d).response.usage;
+  assert.equal(u.total_tokens, 107);
+  assert.equal(u.input_tokens_details.cached_tokens, 90);
+  assert.equal(u.output_tokens_details.reasoning_tokens, 0);
+  assert.equal(normalizeResponsesSseData('{"type":"response.output_text.delta","delta":"x"}'), '{"type":"response.output_text.delta","delta":"x"}');
+});

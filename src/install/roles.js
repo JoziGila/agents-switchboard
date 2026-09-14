@@ -7,8 +7,12 @@ export const MANAGED_TOML = '# managed by agents-switchboard';
 export const MANAGED_MD = '<!-- managed by agents-switchboard -->';
 /** Role files written for each client, in this order. */
 export const ROLE_NAMES = ['explorer', 'worker', 'reviewer', 'senior'];
+/** Claude Code also gets same-name overrides of its built-in Explore and Plan agents, which otherwise ignore CLAUDE_CODE_SUBAGENT_MODEL. */
+export const CLAUDE_ROLE_NAMES = [...ROLE_NAMES, 'Explore', 'Plan'];
 
 const INSTRUCTIONS = {
+  Explore: 'You are a codebase explorer. Find the files, symbols and call paths the parent asked about. Report a direct answer first, then file:line evidence, at most a screenful. Do not modify files. Do not speculate beyond what you read.',
+  Plan: 'You research the codebase so the parent can plan. Map the relevant modules, their contracts and the places a change would touch, with file:line references. Report a compact map, at most a screenful. Do not modify files.',
   explorer: "You are an explorer. Answer the parent's question about the codebase with file paths and line references. Read as much as you need; report only what the parent needs: a direct answer first, then the evidence, at most a screenful. Do not modify files. Do not speculate beyond what you read.",
   worker: 'You are a worker. Implement exactly the task the parent specified, run the relevant tests, and report a short diff summary and the test result, at most a screenful; include failing output verbatim only for the failures. If the task is under-specified or you are blocked, stop and say what you need instead of guessing.',
   reviewer: 'You are a reviewer. Read the diff and the surrounding code, run the tests if they exist. Report concrete defects with file and line, ranked by severity, each with a one-line fix suggestion. Do not restate the diff. Say clearly when you find nothing.',
@@ -76,15 +80,25 @@ export function claudeRoles({ pro = false } = {}) {
   return {
     explorer: {
       description: 'Fast, read-only codebase exploration on DeepSeek Flash. Use for finding files, tracing call paths, summarising modules, answering questions about existing code.',
-      model: 'deepseek-flash[1m]', tools: readOnly,
+      model: 'deepseek-flash[1m]', tools: readOnly, effort: 'low',
     },
     worker: {
       description: 'Implementation on DeepSeek Flash for bounded, fully specified changes: a function, a test, a migration, a refactor within one module.',
-      model: 'deepseek-flash[1m]',
+      model: 'deepseek-flash[1m]', effort: 'high',
     },
     reviewer: {
       description: `Independent review on DeepSeek ${pro ? 'V4 Pro' : 'Flash'}. Use to check a diff for bugs, missing tests and spec mismatches before the parent accepts it.`,
-      model: pro ? 'deepseek-v4-pro' : 'deepseek-flash[1m]', tools: readOnly,
+      model: pro ? 'deepseek-v4-pro' : 'deepseek-flash[1m]', tools: readOnly, effort: 'high',
+    },
+    // Same-name overrides of the built-in agents Claude reaches for on its own; the built-ins inherit the
+    // main model and ignore CLAUDE_CODE_SUBAGENT_MODEL (sub-agents docs, "Built-in subagents").
+    Explore: {
+      description: 'Fast agent specialized for exploring codebases. Use for file discovery, code search, and codebase exploration. Runs on DeepSeek Flash.',
+      model: 'deepseek-flash[1m]', tools: readOnly, effort: 'low',
+    },
+    Plan: {
+      description: 'Codebase research for planning. Read-only. Runs on DeepSeek Flash.',
+      model: 'deepseek-flash[1m]', tools: readOnly, effort: 'high',
     },
     senior: {
       description: pro
@@ -104,6 +118,7 @@ export function claudeRoles({ pro = false } = {}) {
 export function renderClaudeRole(name, role) {
   const frontmatter = ['---', `name: ${name}`, `description: ${role.description}`, `model: ${role.model}`];
   if (role.tools) frontmatter.push(`tools: ${role.tools}`);
+  if (role.effort) frontmatter.push(`effort: ${role.effort}`);
   frontmatter.push('---');
   return [...frontmatter, MANAGED_MD, INSTRUCTIONS[name], ''].join('\n');
 }
