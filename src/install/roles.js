@@ -65,15 +65,15 @@ export function claudeRoles({ pro = false } = {}) {
   return {
     explorer: {
       description: 'Fast, read-only codebase exploration on DeepSeek Flash. Use for finding files, tracing call paths, summarising modules, answering questions about existing code.',
-      model: 'deepseek-flash', tools: readOnly,
+      model: 'deepseek-flash[1m]', tools: readOnly,
     },
     worker: {
       description: 'Implementation on DeepSeek Flash for bounded, fully specified changes: a function, a test, a migration, a refactor within one module.',
-      model: 'deepseek-flash',
+      model: 'deepseek-flash[1m]',
     },
     reviewer: {
       description: `Independent review on DeepSeek ${pro ? 'V4 Pro' : 'Flash'}. Use to check a diff for bugs, missing tests and spec mismatches before the parent accepts it.`,
-      model: pro ? 'deepseek-v4-pro' : 'deepseek-flash', tools: readOnly,
+      model: pro ? 'deepseek-v4-pro' : 'deepseek-flash[1m]', tools: readOnly,
     },
     senior: {
       description: pro

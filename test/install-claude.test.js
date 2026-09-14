@@ -9,8 +9,8 @@ test('managed env keys are merged and recorded', () => {
   const { settings, state } = applyClaudeSettings({ env: { FOO: '1' }, model: 'claude-fable-5-1' }, 4141);
   assert.equal(settings.env.FOO, '1');
   assert.equal(settings.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:4141/anthropic');
-  assert.equal(settings.env.CLAUDE_CODE_SUBAGENT_MODEL, 'deepseek-flash');
-  assert.equal(settings.env.ANTHROPIC_CUSTOM_MODEL_OPTION, 'deepseek-flash');
+  assert.equal(settings.env.CLAUDE_CODE_SUBAGENT_MODEL, 'deepseek-flash[1m]');
+  assert.equal(settings.env.ANTHROPIC_CUSTOM_MODEL_OPTION, 'deepseek-flash[1m]');
   assert.equal(settings.model, 'claude-fable-5-1');
   assert.deepEqual(settings.modelSettings['deepseek-flash'], { effort: 'high' });
   assert.equal(state.env.ANTHROPIC_BASE_URL, null, 'null records "we added it"');
@@ -66,7 +66,7 @@ test('installClaude writes settings, roles and CLAUDE.md; uninstall restores', a
     assert.equal(read(path.join(home, 'agents', 'reviewer.md')), '---\nname: reviewer\n---\nmine\n');
     const explorer = read(path.join(home, 'agents', 'explorer.md'));
     assert.match(explorer, /^---\nname: explorer\n/);
-    assert.match(explorer, /\nmodel: deepseek-flash\ntools: Read, Grep, Glob, Bash\n---\n<!-- managed by agents-switchboard -->\nYou are an explorer\./);
+    assert.match(explorer, /\nmodel: deepseek-flash\[1m\]\ntools: Read, Grep, Glob, Bash\n---\n<!-- managed by agents-switchboard -->\nYou are an explorer\./);
     assert.match(read(path.join(home, 'agents', 'senior.md')), /\nmodel: inherit\n/);
     assert.doesNotMatch(read(path.join(home, 'agents', 'worker.md')), /\ntools:/);
     assert.match(read(path.join(home, 'CLAUDE.md')), /^# Global\n\n<!-- agents-switchboard delegation policy -->/);

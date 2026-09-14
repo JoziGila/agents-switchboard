@@ -15,8 +15,8 @@ export function baseUrlFor(port) {
 export function managedEnv(port) {
   return {
     ANTHROPIC_BASE_URL: baseUrlFor(port),
-    CLAUDE_CODE_SUBAGENT_MODEL: 'deepseek-flash',
-    ANTHROPIC_CUSTOM_MODEL_OPTION: 'deepseek-flash',
+    CLAUDE_CODE_SUBAGENT_MODEL: 'deepseek-flash[1m]',
+    ANTHROPIC_CUSTOM_MODEL_OPTION: 'deepseek-flash[1m]',
     ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: 'DeepSeek Flash',
     ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION: 'DeepSeek V4.1 Flash · 1M context · via switchboard',
   };
