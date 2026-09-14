@@ -4,6 +4,7 @@ import { rewriteMessagesRequest, hasUnsignedThinking, stripUnsignedThinking, nor
 import { readBody, decodeBody, sendJson, upstreamHeaders, upstreamRequest, relayResponse, passThrough, readResponse } from '../proxy.js';
 import { createSseRelay } from '../sse.js';
 import { providerHeaders, requireClientAuth, requireProviderKey } from './shared.js';
+import { detectExhaustion } from '../failover.js';
 
 /** Claude Code aborts a stream silent for 300 s; a provider can think longer than that without a byte. */
 const PING_INTERVAL_MS = 20_000;
@@ -12,43 +13,19 @@ const anthropicError = (type, message) => ({ type: 'error', error: { type, messa
 
 /** @param {import('../server.js').RouteContext} ctx */
 export function claudeRoutes(ctx) {
-  const { anthropic, providers, stats, log } = ctx;
+  const { anthropic, providers, stats, log, failover } = ctx;
 
   const profileFor = (provider) => (provider.name === 'openrouter' ? OPENROUTER_MESSAGES : DEEPSEEK_MESSAGES);
 
-  /** POST /v1/messages: unclaimed models pass through (original bytes unless unsigned thinking must go); provider models are adapted. */
-  async function messages(req, res, upstreamPath) {
-    const raw = await readBody(req);
-    let body;
-    try { body = JSON.parse(decodeBody(raw, req.headers['content-encoding']).toString('utf8')); }
-    catch (e) { sendJson(res, 400, anthropicError('invalid_request_error', `switchboard: cannot read request body: ${e.message}`)); return; }
-    const model = body.model;
-    const role = req.headers['x-claude-code-agent-id'] ? 'subagent' : 'main';
-    const t0 = Date.now();
-    const provider = resolveProvider(providers, model);
-
-    if (!provider) {
-      if (!requireClientAuth(req, res)) return;
-      const url = new URL(upstreamPath, anthropic);
-      let payload = raw, overrides = {};
-      if (hasUnsignedThinking(body)) {
-        payload = Buffer.from(JSON.stringify(stripUnsignedThinking(body)));
-        overrides = { 'content-encoding': null, 'content-length': payload.length };
-        log('stripped unsigned thinking blocks before anthropic');
-      }
-      const up = await upstreamRequest(url, { method: 'POST', headers: upstreamHeaders(req.headers, url, overrides), body: payload });
-      relayResponse(up, res);
-      stats.record({ client: 'claude', route: 'messages', model, role, upstream: 'anthropic', status: up.statusCode, ms: Date.now() - t0 });
-      return;
-    }
-
+  /** Send a parsed body to a provider and relay its stream. */
+  async function toProvider(req, res, provider, body, role, t0, via) {
     const key = await requireProviderKey(provider, res);
     if (!key) return;
     const { body: rewritten, notes } = rewriteMessagesRequest(body, profileFor(provider));
     if (notes.length) log(`messages adapter (${provider.name}): ${notes.join('; ')}`);
     const url = new URL(provider.messagesPath, provider.baseUrl);
     const payload = Buffer.from(JSON.stringify(rewritten));
-    const entry = { client: 'claude', route: 'messages', model: rewritten.model, role, upstream: provider.name };
+    const entry = { client: 'claude', route: 'messages', model: rewritten.model, role, upstream: provider.name, ...(via ? { via } : {}) };
     let up;
     try { up = await upstreamRequest(url, { method: 'POST', headers: providerHeaders(req.headers, url, provider.authHeaders('messages', key), payload.length), body: payload }); }
     catch (e) { sendJson(res, 502, anthropicError('api_error', `switchboard: ${provider.name} unreachable: ${e.message}`)); stats.record({ ...entry, error: e.message }); return; }
@@ -65,6 +42,45 @@ export function claudeRoutes(ctx) {
     const relay = createSseRelay({ mapData: normalizeSseData, pingMs: PING_INTERVAL_MS, onEvent: (j) => { const u = usageFromMessagesEvent(j); if (u) usage = { ...(usage ?? {}), ...u }; } });
     relayResponse(up, res, { transform: relay });
     up.on('end', () => stats.record({ ...entry, status: up.statusCode, ms: Date.now() - t0, usage, requestId: up.headers['x-request-id'] ?? up.headers['x-deepseek-request-id'] ?? up.headers['x-generation-id'] }));
+  }
+
+  /** POST /v1/messages: unclaimed models pass through (original bytes unless unsigned thinking must go); provider models are adapted. */
+  async function messages(req, res, upstreamPath) {
+    const raw = await readBody(req);
+    let body;
+    try { body = JSON.parse(decodeBody(raw, req.headers['content-encoding']).toString('utf8')); }
+    catch (e) { sendJson(res, 400, anthropicError('invalid_request_error', `switchboard: cannot read request body: ${e.message}`)); return; }
+    const model = body.model;
+    const role = req.headers['x-claude-code-agent-id'] ? 'subagent' : 'main';
+    const t0 = Date.now();
+    const provider = resolveProvider(providers, model);
+    if (provider) return toProvider(req, res, provider, body, role, t0);
+
+    if (!requireClientAuth(req, res)) return;
+    const fallback = failover.enabled ? resolveProvider(providers, failover.model) : null;
+    if (fallback && failover.state.isActive('claude')) {
+      log(`failover active for claude: ${model} → ${failover.model}`);
+      return toProvider(req, res, fallback, { ...body, model: failover.model }, role, t0, 'failover');
+    }
+    const url = new URL(upstreamPath, anthropic);
+    let payload = raw, overrides = {};
+    if (hasUnsignedThinking(body)) {
+      payload = Buffer.from(JSON.stringify(stripUnsignedThinking(body)));
+      overrides = { 'content-encoding': null, 'content-length': payload.length };
+      log('stripped unsigned thinking blocks before anthropic');
+    }
+    const up = await upstreamRequest(url, { method: 'POST', headers: upstreamHeaders(req.headers, url, overrides), body: payload });
+    if (fallback && up.statusCode === 429) {
+      const text = (await readResponse(up)).toString('utf8');
+      const verdict = detectExhaustion('claude', 429, up.headers, text);
+      stats.record({ client: 'claude', route: 'messages', model, role, upstream: 'anthropic', status: 429, ms: Date.now() - t0 });
+      if (!verdict.triggered) { res.writeHead(429, { 'content-type': 'application/json', ...(up.headers['retry-after'] ? { 'retry-after': up.headers['retry-after'] } : {}) }); res.end(text); return; }
+      failover.state.activate('claude', verdict.resetAt, verdict.reason);
+      log(`claude usage limit reached (${verdict.reason}); failing over to ${failover.model} until ${verdict.resetAt.toISOString()}`);
+      return toProvider(req, res, fallback, { ...body, model: failover.model }, role, t0, 'failover');
+    }
+    relayResponse(up, res);
+    stats.record({ client: 'claude', route: 'messages', model, role, upstream: 'anthropic', status: up.statusCode, ms: Date.now() - t0 });
   }
 
   /** count_tokens: providers have no such endpoint; a 404 makes Claude Code fall back to its own estimate. */

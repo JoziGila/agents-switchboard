@@ -25,7 +25,7 @@ export const DEFAULT_CONFIG = Object.freeze({
       models: [],
     },
   },
-  failover: { enabled: false, model: 'deepseek-flash' },
+  failover: { enabled: true, model: 'deepseek-flash' },
 });
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);

@@ -3,6 +3,7 @@ import http from 'node:http';
 import { entriesFor, catalogHash } from './catalog.js';
 import { buildProviders } from './providers.js';
 import { createProvenance } from './provenance.js';
+import { createFailoverState } from './failover.js';
 import { sendJson } from './proxy.js';
 import { createStats } from './stats.js';
 import { renderStatusPage } from './status-page.js';
@@ -18,6 +19,7 @@ import { CODEX_PREFIX, CLAUDE_PREFIX } from './routes/shared.js';
  * @property {{entries: object[], slugs: string[], hash: string}} catalog  entries injected into the Codex picker
  * @property {ReturnType<typeof createStats>} stats
  * @property {ReturnType<typeof createProvenance>} provenance  which provider produced which reasoning item
+ * @property {{enabled: boolean, model: string|null, state: ReturnType<typeof createFailoverState>}} failover
  * @property {(line: string) => void} log
  */
 
@@ -39,6 +41,7 @@ export function createServer({ config, keyFor, logFile, log = () => {} }) {
     catalog: { entries, slugs: entries.map((e) => e.slug), hash: catalogHash(entries) },
     stats: createStats({ logFile }),
     provenance: createProvenance(),
+    failover: { enabled: !!config.failover?.enabled, model: config.failover?.model ?? null, state: createFailoverState() },
     log,
   };
   const codex = codexRoutes(ctx);
@@ -51,7 +54,7 @@ export function createServer({ config, keyFor, logFile, log = () => {} }) {
       routes: { codex: `${CODEX_PREFIX}/*`, claude: `${CLAUDE_PREFIX}/*` },
       providers: Object.fromEntries(providers.map((p) => [p.name, { models: p.models, base_url: p.baseUrl.origin }])),
       deepseekModels: ctx.catalog.slugs,
-      failover: { enabled: !!config.failover?.enabled, model: config.failover?.model ?? null, active: null },
+      failover: { enabled: ctx.failover.enabled, model: ctx.failover.model, active: ctx.failover.state.snapshot() },
       ...ctx.stats.snapshot(),
     };
   }
@@ -64,7 +67,7 @@ export function createServer({ config, keyFor, logFile, log = () => {} }) {
       case '/switchboard/health': return sendJson(res, 200, { ok: true });
       case '/switchboard/status': return sendJson(res, 200, statusJson());
       case '/switchboard': case '/switchboard/': res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(renderStatusPage(statusJson()));
-      case '/switchboard/failover/reset': if (req.method === 'POST') return sendJson(res, 200, { ok: true, note: 'failover state machine ships in phase 2' });
+      case '/switchboard/failover/reset': if (req.method === 'POST') { ctx.failover.state.reset(); return sendJson(res, 200, { ok: true, active: {} }); }
     }
     sendJson(res, 404, { error: { message: 'agents-switchboard: unknown route' } });
   }

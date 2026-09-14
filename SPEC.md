@@ -1,6 +1,6 @@
 # agents-switchboard — Specification
 
-Status: v0.6, 2026-09-14. OpenRouter added as a second provider for both clients; DeepSeek integration follows DeepSeek's own harness (Appendix D, docs/deepseek-standard.md). Both base-URL contracts verified live (§2.1). Phase 1 implemented, installed on the author's machine, and verified with `switchboard test`: a Codex explorer ran 14 requests on DeepSeek Flash (94% cache hits) and a Claude Code explorer ran on Flash.
+Status: v0.7, 2026-09-14. Quota failover implemented for both clients (§8). OpenRouter added as a second provider for both clients; DeepSeek integration follows DeepSeek's own harness (Appendix D, docs/deepseek-standard.md). Both base-URL contracts verified live (§2.1). Phase 1 implemented, installed on the author's machine, and verified with `switchboard test`: a Codex explorer ran 14 requests on DeepSeek Flash (94% cache hits) and a Claude Code explorer ran on Flash.
 Reviewed against: openai/codex `main` @ 2f8603f (CLI 0.154.0, desktop runtime 0.154.0-alpha.6.2); Claude Code 2.1.270 and its gateway protocol docs; DeepSeek API docs (Responses API, Anthropic-compatible API, context caching, pricing) as of 2026-09-14.
 
 ## 1. Summary
@@ -239,11 +239,11 @@ The built-in OpenAI provider advertises WebSocket support and Codex tries to upg
 | Codex | HTTP 429 from ChatGPT with body `error.type = "usage_limit_reached"`, plus `x-codex-primary-used-percent`, `x-codex-primary-reset-at`, `x-codex-rate-limit-reached-type` headers (`codex-api/src/api_bridge.rs`). |
 | Claude Code | HTTP 429 from Anthropic with `error.type = "rate_limit_error"` and the subscription's unified-limit signal (`anthropic-ratelimit-unified-status: rejected` header, or a message naming a session, weekly, or model limit). The documented `retry-after`-style per-minute limits are not a trigger: they are transient and both clients retry them. |
 
-The exact Claude 429 for subscriptions is not in public docs. Phase 2 captures one and pins it as a fixture before failover ships for Claude Code.
+The exact Claude 429 for subscriptions is not in public docs; the detector accepts the unified-limit `rejected` header or a message naming a session, weekly, monthly, or model limit, and treats every other `rate_limit_error` as transient. The first real capture will be pinned as a fixture.
 
 ### 8.2 Behaviour
 
-With `failover.enabled = true`, on a trigger the switchboard:
+With `failover.enabled = true` (the default), pass-through bodies are buffered instead of streamed so they can be re-sent; on a trigger the switchboard:
 
 1. records `exhausted_until` per client from the reset header (`x-codex-primary-reset-at`, `anthropic-ratelimit-unified-reset`), else `error.resets_at`, else `retry-after`, else now + 5 min;
 2. rewrites the request for the fallback model (§8.3) and sends it to DeepSeek;
@@ -256,7 +256,7 @@ While `exhausted_until` is in the future, that client's frontier-bound requests 
 
 Claude Code: swap `model`, apply §6.2. DeepSeek maps Claude model names itself, so even an unswapped body would land on Flash; the swap is for clarity and for the `message_start.model` echo, which makes `/usage` attribute the turn to DeepSeek.
 
-Codex: swap `model`, apply §6.1. Bodies built for `use_responses_lite` models (GPT‑6 Astra) additionally need the `additional_tools` developer item lifted into `tools`, the base-instructions developer message lifted into `instructions`, and `namespace` tools flattened. Phase 2 ships Codex failover for plain-function-tool models (gpt‑5.5, gpt‑5.6 family); phase 3 adds the responses-lite conversion and validates it against GPT‑6 Astra.
+Codex: swap `model`, apply §6.1. Bodies built for `use_responses_lite` models (GPT‑6 Astra) additionally get the `additional_tools` developer item lifted into `tools` and `namespace` tools flattened (`liftResponsesLite`); the base-instructions developer message stays in the input, which the fallback model reads as context. Failover for plain-function-tool models (gpt‑5.5, gpt‑5.6 family) is verified against mocks; the GPT‑6 Astra reshaping is best effort until validated live.
 
 ### 8.4 What the user sees
 
@@ -498,7 +498,7 @@ model = "deepseek-flash"
 | Phase | Delivers |
 |---|---|
 | 1 | Router with both pass-throughs, both DeepSeek adapters, Codex catalog injection, WebSocket decline, ping insurance, installer for both clients, roles, delegation policy, doctor, test, status. DeepSeek subagents everywhere; DeepSeek as main model by picker. |
-| 2 | Quota failover for Claude Code and for function-tool GPT models. Captured 429 fixtures. Cost and cache dashboards. Local compaction shim for DeepSeek main sessions in Codex, built as a prefix extension of the last request (same instructions, tools and history, directive appended last) so the summary call itself is mostly cache hits, the way DeepSeek's harness does it. |
+| 2 | Done: quota failover for both clients, provider-reported cost, cache ratios per role. Open: captured real 429 fixtures; local compaction shim for DeepSeek main sessions in Codex, built as a prefix extension of the last request so the summary call is mostly cache hits, the way DeepSeek's harness does it. |
 | 3 | WebSocket splice for GPT traffic. Responses-lite reshaping for GPT‑6 Astra failover. Codex multi-agent v2 verification. |
 | 4 | Any Responses- or Messages-compatible upstream as a subagent provider; per-role cost budgets. |
 

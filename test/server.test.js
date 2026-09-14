@@ -19,10 +19,15 @@ const sse = (res, events) => { res.writeHead(200, { 'content-type': 'text/event-
 let openai, anthropic, deepseek, openrouter, sb, base;
 before(async () => {
   openai = await mock('openai', (req, res) => {
+    if (req.headers['x-mock'] === 'quota') { res.writeHead(429, { 'content-type': 'application/json', 'x-codex-primary-reset-at': String(Math.floor(Date.now() / 1000) + 600) }); res.end(JSON.stringify({ error: { type: 'usage_limit_reached', message: 'The usage limit has been reached' } })); return; }
+    if (req.headers['x-mock'] === 'ratelimit') { res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '3' }); res.end(JSON.stringify({ error: { type: 'rate_limit_exceeded', message: 'slow down' } })); return; }
     if (req.url.startsWith('/backend-api/codex/models')) { res.writeHead(200, { 'content-type': 'application/json', etag: '"up1"' }); res.end(JSON.stringify({ models: [{ slug: 'gpt-5.5' }] })); return; }
     sse(res, [{ type: 'response.completed', response: { usage: { input_tokens: 1, output_tokens: 1 } } }]);
   });
-  anthropic = await mock('anthropic', (req, res) => sse(res, [{ type: 'message_start', message: { usage: { input_tokens: 5 } } }, { type: 'message_stop' }]));
+  anthropic = await mock('anthropic', (req, res) => {
+    if (req.headers['x-mock'] === 'quota') { res.writeHead(429, { 'content-type': 'application/json', 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-reset': String(Math.floor(Date.now() / 1000) + 600) }); res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: "You've hit your session limit" } })); return; }
+    return sse(res, [{ type: 'message_start', message: { usage: { input_tokens: 5 } } }, { type: 'message_stop' }]);
+  });
   deepseek = await mock('deepseek', (req, res) => {
     if (req.url === '/responses') return sse(res, [{ type: 'response.completed', response: { usage: { input_tokens: 100, output_tokens: 7, input_tokens_details: { cached_tokens: 90 } } } }]);
     if (req.url === '/anthropic/v1/messages') return sse(res, [{ type: 'message_start', message: { usage: { input_tokens: 50, prompt_cache_hit_tokens: 40 } } }, { type: 'message_delta', usage: { output_tokens: 3, prompt_cache_hit_tokens: 40, input_tokens: 50 } }]);
@@ -41,7 +46,7 @@ before(async () => {
       deepseek: { base_url: `http://127.0.0.1:${deepseek.address().port}`, models: ['deepseek-flash', 'deepseek-v4-pro'] },
       openrouter: { base_url: `http://127.0.0.1:${openrouter.address().port}`, models: ['qwen/qwen3-coder'] },
     },
-    failover: { enabled: false, model: 'deepseek-flash' },
+    failover: { enabled: true, model: 'deepseek-flash' },
   };
   sb = createServer({ config, keyFor: async (section) => (section === config.upstream.openrouter ? 'sk-or-test' : 'sk-ds-test') });
   await new Promise((r) => sb.listen(0, '127.0.0.1', r));
@@ -173,4 +178,44 @@ test('claude openrouter model routes to /v1/messages with adaptive thinking kept
   assert.equal(sent.model, 'anthropic/claude-sonnet-5');
   assert.deepEqual(sent.thinking, { type: 'adaptive' });
   assert.equal(up.headers['anthropic-beta'], undefined);
+});
+
+test('codex quota 429 fails the turn over to the fallback provider and stays there until reset', async () => {
+  const before = seen.openai.length;
+  const body = zlib.zstdCompressSync(Buffer.from(JSON.stringify({ model: 'gpt-5.5', input: [{ type: 'message', role: 'user', content: [] }], tools: [] })));
+  let r = await post('/backend-api/codex/responses', body, { 'content-encoding': 'zstd', authorization: 'Bearer t', 'x-codex-routing-hint': 'model=gpt-5.5', 'x-mock': 'quota' });
+  assert.equal(r.status, 200);
+  assert.match(await r.text(), /response\.completed/);
+  assert.equal(JSON.parse(seen.deepseek.at(-1).body.toString()).model, 'deepseek-flash');
+  assert.equal(sb.statusJson().failover.active.codex?.reason, 'The usage limit has been reached');
+  // second request: OpenAI is not even asked
+  r = await post('/backend-api/codex/responses', body, { 'content-encoding': 'zstd', authorization: 'Bearer t', 'x-codex-routing-hint': 'model=gpt-5.5' });
+  assert.equal(r.status, 200); await r.text();
+  assert.equal(seen.openai.length, before + 1);
+  // reset clears it and OpenAI is used again
+  assert.equal((await fetch(base + '/switchboard/failover/reset', { method: 'POST' })).status, 200);
+  r = await post('/backend-api/codex/responses', body, { 'content-encoding': 'zstd', authorization: 'Bearer t', 'x-codex-routing-hint': 'model=gpt-5.5' });
+  assert.equal(r.status, 200); await r.text();
+  assert.equal(seen.openai.length, before + 2);
+  assert.deepEqual(sb.statusJson().failover.active, {});
+});
+
+test('a plain rate limit is relayed as 429, not failed over', async () => {
+  const body = zlib.zstdCompressSync(Buffer.from(JSON.stringify({ model: 'gpt-5.5', input: [] })));
+  const r = await post('/backend-api/codex/responses', body, { 'content-encoding': 'zstd', authorization: 'Bearer t', 'x-codex-routing-hint': 'model=gpt-5.5', 'x-mock': 'ratelimit' });
+  assert.equal(r.status, 429);
+  assert.equal((await r.json()).error.type, 'rate_limit_exceeded');
+  assert.deepEqual(sb.statusJson().failover.active, {});
+});
+
+test('claude session-limit 429 fails over to the fallback provider', async () => {
+  const body = JSON.stringify({ model: 'claude-sonnet-5', thinking: { type: 'adaptive' }, messages: [{ role: 'user', content: 'hi' }] });
+  const r = await post('/anthropic/v1/messages?beta=true', body, { authorization: 'Bearer sk-ant-oat', 'x-mock': 'quota' });
+  assert.equal(r.status, 200);
+  assert.match(await r.text(), /message_start/);
+  const sent = JSON.parse(seen.deepseek.at(-1).body.toString());
+  assert.equal(sent.model, 'deepseek-flash');
+  assert.deepEqual(sent.thinking, { type: 'enabled' });
+  assert.equal(sb.statusJson().failover.active.claude?.reason, "You've hit your session limit");
+  await fetch(base + '/switchboard/failover/reset', { method: 'POST' });
 });

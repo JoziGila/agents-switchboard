@@ -12,6 +12,11 @@ All notable changes to this project are documented here. The format follows [Kee
 - CLI: `install`, `uninstall`, `serve`, `doctor`, `test`, `status`, `logs`, `roles`, `failover`.
 - Status page and JSON endpoint with per-model and per-role token counts, cache hit ratio, and estimated spend.
 
+- OpenRouter as a second provider for both clients: any `vendor/model` id routes to OpenRouter, generic Codex picker entries with per-model overrides, encrypted-reasoning provenance, attribution headers, provider-reported cost.
+- Quota failover: when ChatGPT or claude.ai reports the subscription limit, the turn completes on the fallback model and later requests skip the vendor until its reset time. `switchboard failover on|off|reset`.
+- DeepSeek harness rules enforced in the adapters (effort ladders, never-null content, output placeholders, reasoning replay, thinking shape); see `docs/deepseek-standard.md`.
+- Delegation policy and role prompts rewritten for token efficiency: reading, running and reviewing go to Flash subagents that return a screenful.
+
 ### Safety
 - The router never answers a client with HTTP 401; both clients treat it as an expired login.
 - The installer starts the service, waits for health, and completes a real turn per client through the router before editing any client configuration.
