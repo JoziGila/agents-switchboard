@@ -1,27 +1,29 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import { Writable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { runInstall, runUninstall, detectClients } from '../install/index.js';
-import { installService, uninstallService, serviceStatus } from '../install/service.js';
+import { installService, uninstallService } from '../install/service.js';
 import { resolvePaths } from '../paths.js';
 import { loadConfig, saveConfig, listenAddress, resolveDeepSeekKey } from '../config.js';
 import { setSecret, deleteSecret, keychainAvailable } from '../secrets.js';
-import { probeDeepSeek } from '../deepseek-probe.js';
+import { probeDeepSeek } from '../adapters/probe.js';
 import { baseUrlFor as codexUrl } from '../install/codex.js';
 import { baseUrlFor as claudeUrl } from '../install/claude.js';
 
 const entryPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'bin', 'switchboard.js');
 const out = (s) => process.stdout.write(s + '\n');
 
+/** Prompt on the terminal without echoing the typed characters. Resolves '' when stdin is not a TTY. */
 function askHidden(question) {
   return new Promise((resolve) => {
     if (!process.stdin.isTTY) return resolve('');
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    const muted = new Writable({ write: (_chunk, _enc, cb) => cb() });
+    const rl = readline.createInterface({ input: process.stdin, output: muted, terminal: true });
     process.stdout.write(question);
-    rl._writeToOutput = () => {};
-    rl.question('', (a) => { rl.close(); process.stdout.write('\n'); resolve(a.trim()); });
+    rl.question('', (answer) => { rl.close(); process.stdout.write('\n'); resolve(answer.trim()); });
   });
 }
 

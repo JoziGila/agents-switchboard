@@ -1,39 +1,44 @@
+// Installer orchestration: detect clients, store the key, and run each client installer.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { resolvePaths, codexPresent, claudePresent } from '../paths.js';
 import { DEFAULT_PORT, loadConfig, saveConfig, listenAddress } from '../config.js';
+import { resolvePaths, codexPresent, claudePresent } from '../paths.js';
 import { setSecret, keychainAvailable } from '../secrets.js';
-import { installCodex, uninstallCodex } from './codex.js';
 import { installClaude, uninstallClaude } from './claude.js';
+import { installCodex, uninstallCodex } from './codex.js';
 
 const run = promisify(execFile);
 
-async function version(bin, args = ['--version']) {
+/** `x.y.z` from a client's `--version` output, or undefined when the binary cannot be run. */
+async function clientVersion(bin) {
   try {
-    const { stdout } = await run(bin, args, { timeout: 10_000 });
-    const m = stdout.match(/(\d+\.\d+\.\d+[-\w.]*)/);
-    return m ? m[1] : stdout.trim();
+    const { stdout } = await run(bin, ['--version'], { timeout: 10_000 });
+    return stdout.match(/(\d+\.\d+\.\d+[-\w.]*)/)?.[1] ?? stdout.trim();
   } catch {
+    // Present on disk but not runnable from here (broken shim, PATH differences): version stays unknown.
     return undefined;
   }
 }
 
 /**
- * Which clients are installed on this machine.
+ * Which clients are installed on this machine, with versions when obtainable.
  * @param {import('../paths.js').Paths} [paths]
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {Promise<{ codex: { present: boolean, home: string, version?: string }, claude: { present: boolean, home: string, version?: string } }>}
  */
 export async function detectClients(paths = resolvePaths(), env = process.env) {
   const codex = codexPresent(paths, env);
   const claude = claudePresent(paths, env);
   return {
-    codex: { present: codex, home: paths.codexHome, ...(codex ? { version: await version('codex') } : {}) },
-    claude: { present: claude, home: paths.claudeHome, ...(claude ? { version: await version('claude') } : {}) },
+    codex: { present: codex, home: paths.codexHome, ...(codex ? { version: await clientVersion('codex') } : {}) },
+    claude: { present: claude, home: paths.claudeHome, ...(claude ? { version: await clientVersion('claude') } : {}) },
   };
 }
 
 /**
- * Configure the selected clients. Does not touch the login service (the CLI does that after this succeeds).
- * @param {{ codex?: boolean, claude?: boolean, port?: number, pro?: boolean, dryRun?: boolean, deepseekKey?: string, paths?: import('../paths.js').Paths }} opts
+ * Configure the selected clients. Does not touch the login service; the CLI brings the router up first.
+ * @param {{ codex?: boolean, claude?: boolean, port?: number, pro?: boolean, dryRun?: boolean, deepseekKey?: string, paths?: import('../paths.js').Paths }} [opts]
+ * @returns {Promise<{ detected: object, codex: object|null, claude: object|null, warnings: string[], port: number, keyStored: boolean }>}
  */
 export async function runInstall(opts = {}) {
   const paths = opts.paths || resolvePaths();
@@ -51,7 +56,7 @@ export async function runInstall(opts = {}) {
         await setSecret(cfg.upstream.deepseek.api_key.keychain, opts.deepseekKey);
         report.keyStored = true;
       } else {
-        report.warnings.push('No OS keychain available; set DEEPSEEK_API_KEY in the service environment and use api_key = { env = "DEEPSEEK_API_KEY" } in the switchboard config.');
+        report.warnings.push(`No OS keychain available; set DEEPSEEK_API_KEY in the service environment and use api_key = { env = "DEEPSEEK_API_KEY" } in ${paths.configFile}.`);
       }
     }
     saveConfig(cfg, paths);
@@ -70,13 +75,14 @@ export async function runInstall(opts = {}) {
 }
 
 /**
- * Undo runInstall for the selected clients.
- * @param {{ codex?: boolean, claude?: boolean, paths?: import('../paths.js').Paths }} opts
+ * Undo runInstall for the selected clients (both by default).
+ * @param {{ codex?: boolean, claude?: boolean, paths?: import('../paths.js').Paths }} [opts]
+ * @returns {Promise<{ codex: object|null, claude: object|null }>}
  */
 export async function runUninstall(opts = {}) {
   const paths = opts.paths || resolvePaths();
-  const report = { codex: null, claude: null };
-  if (opts.codex ?? true) report.codex = await uninstallCodex({ paths });
-  if (opts.claude ?? true) report.claude = await uninstallClaude({ paths });
-  return report;
+  return {
+    codex: (opts.codex ?? true) ? await uninstallCodex({ paths }) : null,
+    claude: (opts.claude ?? true) ? await uninstallClaude({ paths }) : null,
+  };
 }

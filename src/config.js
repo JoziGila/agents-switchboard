@@ -1,3 +1,4 @@
+// The switchboard's own config file (SPEC §11): defaults, load/save, and DeepSeek key resolution.
 import fs from 'node:fs';
 import path from 'node:path';
 import { parse, stringify } from 'smol-toml';
@@ -21,11 +22,14 @@ export const DEFAULT_CONFIG = Object.freeze({
   failover: { enabled: false, model: 'deepseek-flash' },
 });
 
-function isPlainObject(v) {
-  return v !== null && typeof v === 'object' && !Array.isArray(v);
-}
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-/** Deep-merge `over` onto a copy of `base`; arrays and scalars in `over` win outright. */
+/**
+ * Deep-merge `over` onto a copy of `base`; arrays and scalars in `over` win outright.
+ * @param {object} base
+ * @param {object} [over]
+ * @returns {object}
+ */
 export function mergeDeep(base, over) {
   const out = structuredClone(base);
   for (const [k, v] of Object.entries(over || {})) {
@@ -35,16 +39,14 @@ export function mergeDeep(base, over) {
 }
 
 /**
- * Load the switchboard config, merged over defaults. A missing file yields the defaults.
+ * Load the switchboard config merged over the defaults. A missing file yields the defaults.
  * @param {import('./paths.js').Paths} [paths]
+ * @returns {object}
  */
 export function loadConfig(paths = resolvePaths()) {
-  let user = {};
-  if (fs.existsSync(paths.configFile)) {
-    user = parse(fs.readFileSync(paths.configFile, 'utf8'));
-  }
+  const user = fs.existsSync(paths.configFile) ? parse(fs.readFileSync(paths.configFile, 'utf8')) : {};
   const cfg = mergeDeep(DEFAULT_CONFIG, user);
-  // An explicit api_key choice replaces the default one rather than merging with it.
+  // An explicit api_key source replaces the default one instead of merging with it.
   if (user.upstream?.deepseek?.api_key) cfg.upstream.deepseek.api_key = structuredClone(user.upstream.deepseek.api_key);
   return cfg;
 }
@@ -59,23 +61,31 @@ export function saveConfig(cfg, paths = resolvePaths()) {
   fs.writeFileSync(paths.configFile, stringify(cfg) + '\n', { mode: 0o600 });
 }
 
-/** Split `listen` into host and port. */
+/**
+ * Split `listen` ("host:port") into its parts, defaulting to loopback and the default port.
+ * @param {{ listen?: string }} cfg
+ * @returns {{ host: string, port: number }}
+ */
 export function listenAddress(cfg) {
-  const [host, port] = String(cfg.listen).split(':');
-  return { host: host || '127.0.0.1', port: Number(port) || DEFAULT_PORT };
+  const listen = String(cfg.listen ?? '');
+  const colon = listen.lastIndexOf(':');
+  const host = colon === -1 ? listen : listen.slice(0, colon);
+  const port = colon === -1 ? NaN : Number(listen.slice(colon + 1));
+  return { host: host || '127.0.0.1', port: port || DEFAULT_PORT };
 }
 
 /**
- * Resolve the DeepSeek API key from the configured source. Null when unavailable.
+ * Resolve the DeepSeek API key from the configured source: an env var, or the OS keychain with
+ * `DEEPSEEK_API_KEY` as a fallback. Null when unavailable.
  * @param {object} cfg
  * @param {{ env?: NodeJS.ProcessEnv, getSecret?: (name: string) => Promise<string|null> }} [deps]
  * @returns {Promise<string|null>}
  */
 export async function resolveDeepSeekKey(cfg, deps = {}) {
   const env = deps.env || process.env;
-  const read = deps.getSecret || getSecret;
-  const src = cfg.upstream?.deepseek?.api_key || {};
-  if (src.env) return env[src.env] || null;
-  if (src.keychain) return (await read(src.keychain)) || env.DEEPSEEK_API_KEY || null;
+  const readSecret = deps.getSecret || getSecret;
+  const source = cfg.upstream?.deepseek?.api_key || {};
+  if (source.env) return env[source.env] || null;
+  if (source.keychain) return (await readSecret(source.keychain)) || env.DEEPSEEK_API_KEY || null;
   return env.DEEPSEEK_API_KEY || null;
 }

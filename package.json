@@ -5,12 +5,25 @@
   "license": "MIT",
   "repository": "github:JoziGila/agents-switchboard",
   "type": "module",
-  "bin": { "switchboard": "bin/switchboard.js" },
-  "files": ["bin", "src", "catalog", "README.md", "SPEC.md", "LICENSE"],
-  "engines": { "node": ">=22.15" },
+  "bin": {
+    "switchboard": "bin/switchboard.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "catalog",
+    "README.md",
+    "SPEC.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  },
   "scripts": {
+    "check": "node --check bin/switchboard.js && for f in src/*.js src/*/*.js; do node --check \"$f\" || exit 1; done",
     "test": "node --test 'test/*.test.js'",
-    "start": "node bin/switchboard.js serve"
+    "start": "node bin/switchboard.js serve",
+    "prepublishOnly": "npm run check && npm test"
   },
   "dependencies": {
     "smol-toml": "^1.4.2"
@@ -18,5 +31,17 @@
   "switchboard": {
     "codexRange": ">=0.150.0 <0.156.0",
     "claudeRange": ">=2.1.181"
-  }
+  },
+  "keywords": [
+    "codex",
+    "claude-code",
+    "deepseek",
+    "subagents",
+    "proxy",
+    "router",
+    "llm-gateway"
+  ],
+  "homepage": "https://github.com/JoziGila/agents-switchboard#readme",
+  "bugs": "https://github.com/JoziGila/agents-switchboard/issues",
+  "author": "Jozi Gila"
 }

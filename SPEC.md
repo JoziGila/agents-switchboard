@@ -1,6 +1,6 @@
 # agents-switchboard — Specification
 
-Status: v0.4, 2026-09-14. Both base-URL contracts verified live (§2.1); phase 1 implemented and exercised against the real Codex CLI through the router.
+Status: v0.5, 2026-09-14. Both base-URL contracts verified live (§2.1). Phase 1 implemented, installed on the author's machine, and verified with `switchboard test`: a Codex explorer ran 14 requests on DeepSeek Flash (94% cache hits) and a Claude Code explorer ran on Flash.
 Reviewed against: openai/codex `main` @ 2f8603f (CLI 0.154.0, desktop runtime 0.154.0-alpha.6.2); Claude Code 2.1.270 and its gateway protocol docs; DeepSeek API docs (Responses API, Anthropic-compatible API, context caching, pricing) as of 2026-09-14.
 
 ## 1. Summary
@@ -271,6 +271,8 @@ multi_agent_v2 = false
 # <<< agents-switchboard <<<
 ```
 
+The installer brings the router up and proves a real turn per client through it before any client config is edited (§11); an earlier install that skipped this left Claude Code pointed at a dead port.
+
 The installer does not write this as one literal block: TOML puts a top-level key after any table header inside that table, and a second `[features]` header is an error. It inserts `openai_base_url` on its own marker-guarded line before the first table header, merges the `[agents]` and `[features]` keys into existing tables when present, and appends the tables inside the block otherwise. The parsed result is exactly the above. A managed key already present with a different value is reported as a conflict, not overwritten.
 
 `multi_agent_v2` stays off in phase 1: v2 leans on server-side turn state and incremental appends that only the OpenAI backend implements, while v1 sends complete histories. Re-enabling is a phase 3 verification item.
@@ -333,8 +335,8 @@ You are the senior engineer. You receive tasks a faster model could not complete
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:4141/anthropic",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-flash",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION": "deepseek-flash",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-flash[1m]",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "deepseek-flash[1m]",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "DeepSeek Flash",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "DeepSeek V4.1 Flash · 1M context · via switchboard"
   },
@@ -344,7 +346,7 @@ You are the senior engineer. You receive tasks a faster model could not complete
 }
 ```
 
-Existing keys are merged, not replaced. The desktop app, the CLI and the IDE extensions all read this file.
+The `[1m]` suffix tells Claude Code the real context window; without it an unrecognised id is assumed to have 200K and auto-compaction fires early. The router strips the suffix before DeepSeek sees it. Existing keys are merged, not replaced. The desktop app, the CLI and the IDE extensions all read this file.
 
 Role files in `~/.claude/agents/`:
 
@@ -352,7 +354,7 @@ Role files in `~/.claude/agents/`:
 ---
 name: explorer
 description: Fast, read-only codebase exploration on DeepSeek Flash. Use for finding files, tracing call paths, summarising modules, answering questions about existing code.
-model: deepseek-flash
+model: deepseek-flash[1m]
 tools: Read, Grep, Glob, Bash
 ---
 You are an explorer. Answer the parent's question about the codebase with file paths and line references. Do not modify files. Do not speculate beyond what you read. Be brief.

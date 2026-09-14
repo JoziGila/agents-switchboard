@@ -1,0 +1,73 @@
+// Codex traffic: /backend-api/codex/*  (SPEC §4, §5.1, §6.1, §7)
+import { isDeepSeekModel, baseModelId, mergeModels, rewriteEtag } from '../catalog.js';
+import { rewriteResponsesRequest, mapDeepSeekError, usageFromResponsesEvent } from '../adapters/responses.js';
+import { readBody, decodeBody, sendJson, upstreamHeaders, upstreamRequest, relayResponse, passThrough, readResponse } from '../proxy.js';
+import { createSseRelay } from '../sse.js';
+import { CODEX_PREFIX, headersForDeepSeek, modelFromRoutingHint, requireClientAuth, requireDeepSeekKey } from './shared.js';
+
+/** @param {import('../server.js').RouteContext} ctx */
+export function codexRoutes(ctx) {
+  const { openai, deepseek, catalog, stats, deepseekKey } = ctx;
+
+  /** GET /models: proxy upstream, append the DeepSeek entries, fork the ETag. */
+  async function models(req, res) {
+    const url = new URL(req.url, openai);
+    const up = await upstreamRequest(url, { method: 'GET', headers: upstreamHeaders(req.headers, url, { 'accept-encoding': 'identity' }) });
+    if (up.statusCode !== 200) { relayResponse(up, res); stats.record({ client: 'codex', route: 'models', upstream: 'openai', status: up.statusCode }); return; }
+    let payload;
+    try { payload = JSON.parse((await readResponse(up)).toString('utf8')); }
+    catch (e) { sendJson(res, 502, { error: { message: `switchboard: bad models payload: ${e.message}` } }); return; }
+    const etag = rewriteEtag(up.headers.etag, catalog.hash);
+    const headers = { etag, ...(up.headers['cache-control'] ? { 'cache-control': up.headers['cache-control'] } : {}) };
+    sendJson(res, 200, mergeModels(payload, catalog.entries), headers);
+    stats.record({ client: 'codex', route: 'models', upstream: 'openai', status: 200, injected: catalog.slugs });
+  }
+
+  /** POST /responses: route by the routing-hint header; GPT bodies are never decompressed. */
+  async function responses(req, res) {
+    const model = modelFromRoutingHint(req.headers['x-codex-routing-hint']);
+    const role = req.headers['x-openai-subagent'] ? String(req.headers['x-openai-subagent']) : null;
+    const t0 = Date.now();
+    if (!isDeepSeekModel(model)) {
+      if (!requireClientAuth(req, res)) return;
+      const up = await passThrough(req, res, openai, `${CODEX_PREFIX}/responses`);
+      stats.record({ client: 'codex', route: 'responses', model, role, upstream: 'openai', status: up.statusCode, ms: Date.now() - t0 });
+      return;
+    }
+    const key = await requireDeepSeekKey(deepseekKey, res);
+    if (!key) return;
+    let body;
+    try { body = JSON.parse(decodeBody(await readBody(req), req.headers['content-encoding']).toString('utf8')); }
+    catch (e) { sendJson(res, 400, { error: { type: 'invalid_request_error', message: `switchboard: cannot read request body: ${e.message}` } }); return; }
+    const rewritten = rewriteResponsesRequest({ ...body, model: baseModelId(model) });
+    const url = new URL('/responses', deepseek);
+    const payload = Buffer.from(JSON.stringify(rewritten));
+    const headers = { ...headersForDeepSeek(upstreamHeaders(req.headers, url)), authorization: `Bearer ${key}`, 'content-type': 'application/json', 'content-length': payload.length, accept: 'text/event-stream', 'accept-encoding': 'identity' };
+    let up;
+    try { up = await upstreamRequest(url, { method: 'POST', headers, body: payload }); }
+    catch (e) { sendJson(res, 502, { error: { type: 'server_error', message: `switchboard: deepseek unreachable: ${e.message}` } }); stats.record({ client: 'codex', route: 'responses', model, role, upstream: 'deepseek', error: e.message }); return; }
+    if (up.statusCode < 200 || up.statusCode >= 300) {
+      const mapped = mapDeepSeekError(up.statusCode, (await readResponse(up)).toString('utf8'));
+      sendJson(res, mapped.status, mapped.body);
+      stats.record({ client: 'codex', route: 'responses', model, role, upstream: 'deepseek', status: up.statusCode, ms: Date.now() - t0 });
+      return;
+    }
+    let usage = null;
+    const relay = createSseRelay({ onEvent: (j) => { if (j?.type === 'response.completed') usage = usageFromResponsesEvent(j); } });
+    relayResponse(up, res, { transform: relay });
+    up.on('end', () => stats.record({ client: 'codex', route: 'responses', model: rewritten.model, role, upstream: 'deepseek', status: up.statusCode, ms: Date.now() - t0, usage }));
+  }
+
+  /** Everything else under the prefix (usage, compaction, realtime, memories) goes to OpenAI unchanged. */
+  async function other(req, res, sub) {
+    if (!requireClientAuth(req, res)) return;
+    const up = await passThrough(req, res, openai, req.url);
+    stats.record({ client: 'codex', route: sub, upstream: 'openai', status: up.statusCode });
+  }
+
+  return async function handle(req, res, sub) {
+    if (sub === '/models' && req.method === 'GET') return models(req, res);
+    if (sub === '/responses' && req.method === 'POST') return responses(req, res);
+    return other(req, res, sub);
+  };
+}

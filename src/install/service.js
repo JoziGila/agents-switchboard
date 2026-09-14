@@ -1,18 +1,26 @@
+// Login service registration: launchd (macOS), systemd --user (Linux), Scheduled Task (Windows).
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
 export const LABEL = 'dev.agents-switchboard';
+const UNIT = 'agents-switchboard.service';
 
-const plistPath = (home = os.homedir()) => path.join(home, 'Library', 'LaunchAgents', `${LABEL}.plist`);
-const unitPath = (home = os.homedir()) => path.join(home, '.config', 'systemd', 'user', 'agents-switchboard.service');
-
+const plistPath = (home) => path.join(home, 'Library', 'LaunchAgents', `${LABEL}.plist`);
+const unitPath = (home) => path.join(home, '.config', 'systemd', 'user', UNIT);
+const launchdTarget = () => `gui/${os.userInfo().uid}`;
 const xml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+/** Swallow the error from a command whose failure means "already in the desired state". */
+const ignoreFailure = () => {};
 
-/** Render the launchd plist. Pure. */
+/**
+ * Render the launchd plist. Pure.
+ * @param {{ nodePath: string, entryPath: string, logFile: string, pathEnv: string }} opts
+ * @returns {string}
+ */
 export function renderPlist({ nodePath, entryPath, logFile, pathEnv }) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -38,7 +46,11 @@ export function renderPlist({ nodePath, entryPath, logFile, pathEnv }) {
 `;
 }
 
-/** Render the systemd user unit. Pure. */
+/**
+ * Render the systemd user unit. Pure.
+ * @param {{ nodePath: string, entryPath: string, logFile: string, pathEnv: string }} opts
+ * @returns {string}
+ */
 export function renderUnit({ nodePath, entryPath, logFile, pathEnv }) {
   return `[Unit]
 Description=agents-switchboard loopback router
@@ -60,104 +72,152 @@ WantedBy=default.target
 /**
  * Register the router as a login service and start it.
  * @param {{ nodePath?: string, entryPath: string, logFile: string, home?: string, platform?: string }} opts
+ * @returns {Promise<{ kind: 'launchd'|'systemd'|'schtasks', file: string|null }>}
  */
 export async function installService(opts) {
   const nodePath = opts.nodePath || process.execPath;
   const home = opts.home || os.homedir();
   const platform = opts.platform || process.platform;
   const pathEnv = process.env.PATH || '/usr/local/bin:/usr/bin:/bin';
+  const rendering = { nodePath, entryPath: opts.entryPath, logFile: opts.logFile, pathEnv };
   fs.mkdirSync(path.dirname(opts.logFile), { recursive: true, mode: 0o700 });
 
-  if (platform === 'darwin') {
-    const file = plistPath(home);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    await run('launchctl', ['bootout', `gui/${os.userInfo().uid}/${LABEL}`]).catch(() => {});
-    fs.writeFileSync(file, renderPlist({ nodePath, entryPath: opts.entryPath, logFile: opts.logFile, pathEnv }));
-    try {
-      await run('launchctl', ['bootstrap', `gui/${os.userInfo().uid}`, file]);
-    } catch {
-      await run('launchctl', ['load', '-w', file]);
+  switch (platform) {
+    case 'darwin': {
+      const file = plistPath(home);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      await run('launchctl', ['bootout', `${launchdTarget()}/${LABEL}`]).catch(ignoreFailure); // not loaded yet
+      fs.writeFileSync(file, renderPlist(rendering));
+      try {
+        await run('launchctl', ['bootstrap', launchdTarget(), file]);
+      } catch {
+        // Older launchctl without bootstrap/bootout.
+        await run('launchctl', ['load', '-w', file]);
+      }
+      return { kind: 'launchd', file };
     }
-    return { kind: 'launchd', file };
+    case 'linux': {
+      const file = unitPath(home);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, renderUnit(rendering));
+      await run('systemctl', ['--user', 'daemon-reload']);
+      await run('systemctl', ['--user', 'enable', '--now', UNIT]);
+      await run('systemctl', ['--user', 'restart', UNIT]).catch(ignoreFailure); // enable --now already started a fresh unit
+      return { kind: 'systemd', file };
+    }
+    case 'win32': {
+      const command = `"${nodePath}" "${opts.entryPath}" serve`;
+      await run('schtasks', ['/Delete', '/TN', LABEL, '/F']).catch(ignoreFailure); // not registered yet
+      await run('schtasks', ['/Create', '/TN', LABEL, '/SC', 'ONLOGON', '/RL', 'LIMITED', '/TR', command, '/F']);
+      await run('schtasks', ['/Run', '/TN', LABEL]).catch(ignoreFailure); // already running
+      return { kind: 'schtasks', file: null };
+    }
+    default:
+      throw new Error(`unsupported platform ${platform}: run \`switchboard serve\` under your own supervisor`);
   }
-  if (platform === 'linux') {
-    const file = unitPath(home);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, renderUnit({ nodePath, entryPath: opts.entryPath, logFile: opts.logFile, pathEnv }));
-    await run('systemctl', ['--user', 'daemon-reload']);
-    await run('systemctl', ['--user', 'enable', '--now', 'agents-switchboard.service']);
-    await run('systemctl', ['--user', 'restart', 'agents-switchboard.service']).catch(() => {});
-    return { kind: 'systemd', file };
-  }
-  if (platform === 'win32') {
-    const cmd = `"${nodePath}" "${opts.entryPath}" serve`;
-    await run('schtasks', ['/Delete', '/TN', LABEL, '/F']).catch(() => {});
-    await run('schtasks', ['/Create', '/TN', LABEL, '/SC', 'ONLOGON', '/RL', 'LIMITED', '/TR', cmd, '/F']);
-    await run('schtasks', ['/Run', '/TN', LABEL]).catch(() => {});
-    return { kind: 'schtasks', file: null };
-  }
-  throw new Error(`unsupported platform ${platform}`);
-}
-
-/** Stop and unregister the login service. */
-export async function uninstallService(opts = {}) {
-  const home = opts.home || os.homedir();
-  const platform = opts.platform || process.platform;
-  if (platform === 'darwin') {
-    const file = plistPath(home);
-    await run('launchctl', ['bootout', `gui/${os.userInfo().uid}/${LABEL}`]).catch(() => {});
-    if (fs.existsSync(file)) { await run('launchctl', ['unload', file]).catch(() => {}); fs.unlinkSync(file); }
-    return true;
-  }
-  if (platform === 'linux') {
-    const file = unitPath(home);
-    await run('systemctl', ['--user', 'disable', '--now', 'agents-switchboard.service']).catch(() => {});
-    if (fs.existsSync(file)) fs.unlinkSync(file);
-    await run('systemctl', ['--user', 'daemon-reload']).catch(() => {});
-    return true;
-  }
-  if (platform === 'win32') {
-    await run('schtasks', ['/End', '/TN', LABEL]).catch(() => {});
-    await run('schtasks', ['/Delete', '/TN', LABEL, '/F']).catch(() => {});
-    return true;
-  }
-  return false;
 }
 
 /**
+ * Restart the running service so it picks up a changed switchboard config.
+ * @param {{ home?: string, platform?: string }} [opts]
+ * @returns {Promise<boolean>} false when no service manager is available
+ */
+export async function restartService(opts = {}) {
+  const platform = opts.platform || process.platform;
+  switch (platform) {
+    case 'darwin':
+      await run('launchctl', ['kickstart', '-k', `${launchdTarget()}/${LABEL}`]);
+      return true;
+    case 'linux':
+      await run('systemctl', ['--user', 'restart', UNIT]);
+      return true;
+    case 'win32':
+      await run('schtasks', ['/End', '/TN', LABEL]).catch(ignoreFailure); // not running
+      await run('schtasks', ['/Run', '/TN', LABEL]);
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Stop and unregister the login service.
+ * @param {{ home?: string, platform?: string }} [opts]
+ * @returns {Promise<{ removed: boolean }>}
+ */
+export async function uninstallService(opts = {}) {
+  const home = opts.home || os.homedir();
+  const platform = opts.platform || process.platform;
+  switch (platform) {
+    case 'darwin': {
+      const file = plistPath(home);
+      const removed = fs.existsSync(file);
+      await run('launchctl', ['bootout', `${launchdTarget()}/${LABEL}`]).catch(ignoreFailure); // not loaded
+      if (removed) {
+        await run('launchctl', ['unload', file]).catch(ignoreFailure); // legacy launchctl fallback
+        fs.unlinkSync(file);
+      }
+      return { removed };
+    }
+    case 'linux': {
+      const file = unitPath(home);
+      const removed = fs.existsSync(file);
+      await run('systemctl', ['--user', 'disable', '--now', UNIT]).catch(ignoreFailure); // not enabled
+      if (removed) fs.unlinkSync(file);
+      await run('systemctl', ['--user', 'daemon-reload']).catch(ignoreFailure);
+      return { removed };
+    }
+    case 'win32': {
+      await run('schtasks', ['/End', '/TN', LABEL]).catch(ignoreFailure); // not running
+      const removed = await run('schtasks', ['/Delete', '/TN', LABEL, '/F']).then(() => true, () => false);
+      return { removed };
+    }
+    default:
+      return { removed: false };
+  }
+}
+
+/**
+ * Whether the login service is registered and running.
+ * @param {{ home?: string, platform?: string }} [opts]
  * @returns {Promise<{ installed: boolean, running: boolean, pid?: number }>}
  */
 export async function serviceStatus(opts = {}) {
   const home = opts.home || os.homedir();
   const platform = opts.platform || process.platform;
-  if (platform === 'darwin') {
-    const installed = fs.existsSync(plistPath(home));
-    try {
-      const { stdout } = await run('launchctl', ['print', `gui/${os.userInfo().uid}/${LABEL}`]);
-      const m = stdout.match(/\bpid = (\d+)/);
-      return { installed, running: !!m, ...(m ? { pid: Number(m[1]) } : {}) };
-    } catch {
-      return { installed, running: false };
+  switch (platform) {
+    case 'darwin': {
+      const installed = fs.existsSync(plistPath(home));
+      try {
+        const { stdout } = await run('launchctl', ['print', `${launchdTarget()}/${LABEL}`]);
+        const pid = stdout.match(/\bpid = (\d+)/)?.[1];
+        return { installed, running: !!pid, ...(pid ? { pid: Number(pid) } : {}) };
+      } catch {
+        // launchctl print exits non-zero when the job is not loaded.
+        return { installed, running: false };
+      }
     }
-  }
-  if (platform === 'linux') {
-    const installed = fs.existsSync(unitPath(home));
-    try {
-      const { stdout } = await run('systemctl', ['--user', 'show', 'agents-switchboard.service', '-p', 'ActiveState', '-p', 'MainPID']);
-      const running = /ActiveState=active/.test(stdout);
-      const m = stdout.match(/MainPID=(\d+)/);
-      return { installed, running, ...(m && Number(m[1]) ? { pid: Number(m[1]) } : {}) };
-    } catch {
-      return { installed, running: false };
+    case 'linux': {
+      const installed = fs.existsSync(unitPath(home));
+      try {
+        const { stdout } = await run('systemctl', ['--user', 'show', UNIT, '-p', 'ActiveState', '-p', 'MainPID']);
+        const pid = Number(stdout.match(/MainPID=(\d+)/)?.[1]);
+        return { installed, running: /ActiveState=active/.test(stdout), ...(pid ? { pid } : {}) };
+      } catch {
+        // systemctl show fails when the unit is unknown.
+        return { installed, running: false };
+      }
     }
-  }
-  if (platform === 'win32') {
-    try {
-      const { stdout } = await run('schtasks', ['/Query', '/TN', LABEL, '/FO', 'LIST']);
-      return { installed: true, running: /Running/.test(stdout) };
-    } catch {
+    case 'win32': {
+      try {
+        const { stdout } = await run('schtasks', ['/Query', '/TN', LABEL, '/FO', 'LIST']);
+        return { installed: true, running: /Running/.test(stdout) };
+      } catch {
+        // schtasks /Query fails when the task does not exist.
+        return { installed: false, running: false };
+      }
+    }
+    default:
       return { installed: false, running: false };
-    }
   }
-  return { installed: false, running: false };
 }

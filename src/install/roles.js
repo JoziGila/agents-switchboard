@@ -1,10 +1,12 @@
-/**
- * Role definitions shared by both clients (SPEC §10.1–§10.3).
- * The instruction text is identical across clients so every role shares a prefix shape.
- */
+// Role definitions and the delegation policy shared by both clients (SPEC §10.1–§10.3).
+// The instruction text is identical across clients so every role shares a prefix shape.
 
+/** First line of a Codex role file the installer owns. */
 export const MANAGED_TOML = '# managed by agents-switchboard';
+/** First body line of a Claude Code subagent file the installer owns. */
 export const MANAGED_MD = '<!-- managed by agents-switchboard -->';
+/** Role files written for each client, in this order. */
+export const ROLE_NAMES = ['explorer', 'worker', 'reviewer', 'senior'];
 
 const INSTRUCTIONS = {
   explorer: "You are an explorer. Answer the parent's question about the codebase with file paths and line references. Do not modify files. Do not speculate beyond what you read. Be brief.",
@@ -14,7 +16,9 @@ const INSTRUCTIONS = {
 };
 
 /**
+ * Codex role definitions.
  * @param {{ pro?: boolean }} [opts] `pro` moves reviewer and senior to deepseek-v4-pro.
+ * @returns {Record<string, { description: string, model: string, effort: string, sandbox: string }>}
  */
 export function codexRoles({ pro = false } = {}) {
   return {
@@ -41,7 +45,12 @@ export function codexRoles({ pro = false } = {}) {
   };
 }
 
-/** Render one Codex role file. */
+/**
+ * Render one Codex role file (TOML).
+ * @param {string} name
+ * @param {{ description: string, model: string, effort: string, sandbox: string }} role
+ * @returns {string}
+ */
 export function renderCodexRole(name, role) {
   return [
     MANAGED_TOML,
@@ -58,7 +67,9 @@ export function renderCodexRole(name, role) {
 }
 
 /**
- * @param {{ pro?: boolean }} [opts]
+ * Claude Code subagent definitions.
+ * @param {{ pro?: boolean }} [opts] `pro` moves reviewer and senior to deepseek-v4-pro.
+ * @returns {Record<string, { description: string, model: string, tools?: string }>}
  */
 export function claudeRoles({ pro = false } = {}) {
   const readOnly = 'Read, Grep, Glob, Bash';
@@ -84,17 +95,23 @@ export function claudeRoles({ pro = false } = {}) {
   };
 }
 
-/** Render one Claude Code subagent file. */
+/**
+ * Render one Claude Code subagent file (markdown with YAML frontmatter).
+ * @param {string} name
+ * @param {{ description: string, model: string, tools?: string }} role
+ * @returns {string}
+ */
 export function renderClaudeRole(name, role) {
-  const fm = ['---', `name: ${name}`, `description: ${role.description}`, `model: ${role.model}`];
-  if (role.tools) fm.push(`tools: ${role.tools}`);
-  fm.push('---');
-  return [...fm, MANAGED_MD, INSTRUCTIONS[name], ''].join('\n');
+  const frontmatter = ['---', `name: ${name}`, `description: ${role.description}`, `model: ${role.model}`];
+  if (role.tools) frontmatter.push(`tools: ${role.tools}`);
+  frontmatter.push('---');
+  return [...frontmatter, MANAGED_MD, INSTRUCTIONS[name], ''].join('\n');
 }
 
 export const DELEGATION_START = '<!-- agents-switchboard delegation policy -->';
 export const DELEGATION_END = '<!-- /agents-switchboard -->';
 
+/** The delegation policy appended to AGENTS.md and CLAUDE.md (SPEC §10.3). */
 export const DELEGATION_BLOCK = [
   DELEGATION_START,
   '## Delegation',
@@ -113,6 +130,7 @@ export const DELEGATION_BLOCK = [
 /**
  * Insert or replace the delegation block in a markdown document. Idempotent.
  * @param {string} text existing document ('' when missing)
+ * @returns {string}
  */
 export function upsertDelegation(text) {
   const stripped = removeDelegation(text);
@@ -121,7 +139,11 @@ export function upsertDelegation(text) {
   return `${base}${sep}${DELEGATION_BLOCK}\n`;
 }
 
-/** Remove the delegation block. Returns the text unchanged when absent. */
+/**
+ * Remove the delegation block. Returns the text unchanged when absent.
+ * @param {string} text
+ * @returns {string}
+ */
 export function removeDelegation(text) {
   const start = text.indexOf(DELEGATION_START);
   if (start === -1) return text;

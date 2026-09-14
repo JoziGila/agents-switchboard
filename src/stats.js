@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 
 /** USD per 1M tokens: [offPeak, peak]. Peak: 01:00–04:00 and 06:00–10:00 UTC, Mon–Fri. */
 export const PRICING = {
@@ -25,7 +26,9 @@ export function createStats({ logFile } = {}) {
   const roles = {};    // role -> { requests, input, cached }
   const upstreams = {}; // name -> { lastOk, lastError }
   let stream = null;
-  if (logFile) { try { fs.mkdirSync(require_dirname(logFile), { recursive: true }); stream = fs.createWriteStream(logFile, { flags: 'a' }); } catch {} }
+  if (logFile) {
+    try { fs.mkdirSync(path.dirname(logFile), { recursive: true }); stream = fs.createWriteStream(logFile, { flags: 'a' }); } catch {}
+  }
 
   function record(entry) {
     const { model, role, usage } = entry;
@@ -50,5 +53,3 @@ export function createStats({ logFile } = {}) {
   }
   return { record, snapshot };
 }
-
-function require_dirname(p) { return p.slice(0, Math.max(0, p.lastIndexOf('/'))) || '.'; }
