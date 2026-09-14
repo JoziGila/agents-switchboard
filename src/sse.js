@@ -1,15 +1,17 @@
 import { Transform } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 
 /**
  * Line-oriented SSE relay. `mapData` may rewrite each `data:` payload; `onEvent` observes parsed JSON payloads.
  * When `pingMs` is set and nothing flowed for that long, a synthetic `ping` event is written.
  */
 export function createSseRelay({ mapData, onEvent, pingMs, pingPayload = 'event: ping\ndata: {"type":"ping"}\n\n' } = {}) {
+  const decoder = new StringDecoder('utf8'); // a multi-byte character may be split across TCP chunks
   let rest = '';
   let timer = null;
   const t = new Transform({
     transform(chunk, _enc, cb) {
-      rest += chunk.toString('utf8');
+      rest += decoder.write(chunk);
       const lines = rest.split('\n');
       rest = lines.pop();
       const out = [];
@@ -19,6 +21,7 @@ export function createSseRelay({ mapData, onEvent, pingMs, pingPayload = 'event:
     },
     flush(cb) {
       disarm();
+      rest += decoder.end();
       cb(null, rest ? handle(rest) : '');
     },
   });
