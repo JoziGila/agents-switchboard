@@ -1,6 +1,7 @@
 // Third-party model providers the router can send a request to, and how a model id selects one.
 // The client's own vendor (OpenAI for Codex, Anthropic for Claude Code) is never a provider here:
 // anything no provider claims passes through untouched.
+import { baseModelId } from './catalog.js';
 
 const PROJECT_URL = 'https://github.com/JoziGila/agents-switchboard';
 
@@ -17,7 +18,25 @@ const PROJECT_URL = 'https://github.com/JoziGila/agents-switchboard';
  * @property {Record<string, object>} modelOverrides  per-model catalog overrides
  * @property {(dialect: 'responses'|'messages', conversationId: string|null, reqHeaders: object) => {body: object, headers: object}} requestOptions
  *   provider-specific fields merged into the outgoing body and headers
+ * @property {(dialect: 'responses'|'messages') => URL} endpoint
+ *   the dialect's absolute request URL, joining baseUrl and the dialect's path (baseUrl may itself carry a path, e.g. OpenRouter's `/api`)
  */
+
+/**
+ * Join a base URL with a dialect path. `new URL(path, baseUrl)` is wrong here: when `path` starts with `/`
+ * (every dialect path does), WHATWG resolution discards any path segment already on `baseUrl` — OpenRouter's
+ * `/api` — so a plain `new URL('/v1/messages', 'https://openrouter.ai/api')` resolves to the marketing site,
+ * not the API. Stripping trailing slashes on the base and concatenating avoids that, and tolerates either
+ * side carrying (or missing) a slash at the join.
+ * @param {URL|string} baseUrl
+ * @param {string} path
+ * @returns {URL}
+ */
+function joinEndpoint(baseUrl, path) {
+  const base = String(baseUrl).replace(/\/+$/, '');
+  const suffix = path.startsWith('/') ? path : `/${path}`;
+  return new URL(base + suffix);
+}
 
 /** OpenRouter routing preferences sent with every request; `[upstream.openrouter.provider]` overrides or extends. */
 const OPENROUTER_PROVIDER_DEFAULTS = {
@@ -29,11 +48,6 @@ const OPENROUTER_PROVIDER_DEFAULTS = {
 /** Claude Code beta values OpenRouter forwards to Anthropic-hosted models; login and client markers are not for a third party. */
 function betaForOpenRouter(anthropicBeta) {
   return String(anthropicBeta ?? '').split(',').map((s) => s.trim()).filter((v) => v && !/^oauth-|^claude-code-/.test(v)).join(',');
-}
-
-/** Strip a Claude-style `[1m]` context suffix. */
-export function stripSuffix(model) {
-  return String(model ?? '').replace(/\[1m\]$/i, '');
 }
 
 /**
@@ -59,6 +73,7 @@ export function buildProviders(config, keyFor) {
       models: ds.models ?? [],
       modelOverrides: ds.model_overrides ?? {},
       requestOptions: () => ({ body: {}, headers: {} }),
+      endpoint(dialect) { return joinEndpoint(this.baseUrl, dialect === 'messages' ? this.messagesPath : this.responsesPath); },
     });
   }
   const or = config.upstream?.openrouter;
@@ -83,6 +98,7 @@ export function buildProviders(config, keyFor) {
         if (dialect === 'messages') { const beta = betaForOpenRouter(reqHeaders['anthropic-beta']); if (beta) headers['x-anthropic-beta'] = beta; }
         return { body, headers };
       },
+      endpoint(dialect) { return joinEndpoint(this.baseUrl, dialect === 'messages' ? this.messagesPath : this.responsesPath); },
     });
   }
   return providers;
@@ -94,7 +110,7 @@ export function buildProviders(config, keyFor) {
  * @param {string|null|undefined} model
  */
 export function resolveProvider(providers, model) {
-  const id = stripSuffix(model);
+  const id = baseModelId(model);
   if (!id) return null;
   return providers.find((p) => p.matches(id)) ?? null;
 }

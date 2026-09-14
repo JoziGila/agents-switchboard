@@ -1,7 +1,7 @@
 // Claude Code installer: merged settings.json keys, subagent files, and the CLAUDE.md delegation block (SPEC §10.2, §10.3).
 import fs from 'node:fs';
 import path from 'node:path';
-import { DEFAULT_PORT } from '../config.js';
+import { DEFAULT_PORT, baseUrlFor } from '../config.js';
 import { resolvePaths } from '../paths.js';
 import { backupFile, readTextOr, readState, writeState, writeRoleFiles, removeRoleFiles, previewRoles, upsertDelegationFile, removeDelegationFile } from './files.js';
 import { claudeRoles, renderClaudeRole, MANAGED_MD, CLAUDE_ROLE_NAMES, upsertDelegation } from './roles.js';
@@ -14,26 +14,21 @@ const MODEL_SETTINGS_VALUE = 'high';
 const CREDENTIAL_ENV = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'];
 /** Forces every subagent, including senior's `inherit`, onto the subagent model; the Explore/Plan files are the intended mechanism instead. */
 const FORCE_ENV = 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE';
-/** `http://127.0.0.1:<port>/anthropic` is ours whatever the port, even when state.json was lost. */
-const OUR_URL_SHAPE = /^http:\/\/127\.0\.0\.1:\d+\/anthropic\/?$/;
-
 /**
- * The `ANTHROPIC_BASE_URL` for the switchboard's Anthropic-format prefix.
- * @param {number} port
- * @returns {string}
+ * Ours whatever the port or capability token, even when state.json was lost: the tokenless form older
+ * releases wrote and the `_switchboard/<token>/` form this one writes, so a reinstall migrates.
  */
-export function baseUrlFor(port) {
-  return `http://127.0.0.1:${port}/anthropic`;
-}
+const OUR_URL_SHAPE = /^http:\/\/127\.0\.0\.1:\d+\/(?:_switchboard\/[^/]+\/)?anthropic\/?$/;
 
 /**
  * The env keys the installer owns (SPEC §10.2).
  * @param {number} port
+ * @param {string} [token] capability token the router will require
  * @returns {Record<string, string>}
  */
-export function managedEnv(port) {
+export function managedEnv(port, token) {
   return {
-    ANTHROPIC_BASE_URL: baseUrlFor(port),
+    ANTHROPIC_BASE_URL: baseUrlFor(port, token, '/anthropic'),
     CLAUDE_CODE_SUBAGENT_MODEL: 'deepseek-flash[1m]',
     ANTHROPIC_CUSTOM_MODEL_OPTION: 'deepseek-flash[1m]',
     ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: 'DeepSeek Flash',
@@ -86,18 +81,19 @@ export function findConflicts(settings, ourUrl, state = {}) {
  * @param {object} settings
  * @param {number} port
  * @param {object} [prevState] state.claude from a previous install
+ * @param {{ token?: string }} [opts] capability token the router will require
  * @returns {{ settings: object, state: object }}
  * @throws {Error} when settings.json contains settings the switchboard cannot coexist with
  */
-export function applyClaudeSettings(settings, port, prevState = {}) {
-  const conflicts = findConflicts(settings, baseUrlFor(port), prevState);
+export function applyClaudeSettings(settings, port, prevState = {}, opts = {}) {
+  const conflicts = findConflicts(settings, baseUrlFor(port, opts.token, '/anthropic'), prevState);
   if (conflicts.length) {
     throw new Error(`settings.json has settings the switchboard cannot coexist with: ${conflicts.join(', ')}. Remove them (they would bypass the router or bill an API key instead of your subscription) and re-run.`);
   }
   const next = structuredClone(settings);
   next.env = { ...(next.env || {}) };
   const state = { env: { ...(prevState.env || {}) }, modelSettings: prevState.modelSettings };
-  for (const [key, value] of Object.entries(managedEnv(port))) {
+  for (const [key, value] of Object.entries(managedEnv(port, opts.token))) {
     if (!(key in state.env)) state.env[key] = settings.env?.[key] ?? null;
     next.env[key] = value;
   }
@@ -138,6 +134,16 @@ export function revertClaudeSettings(settings, state = {}) {
 const renderSettings = (settings) => JSON.stringify(settings, null, 2) + '\n';
 
 /**
+ * Whether `settings` still routes Claude at us while no state says what that replaced. Only our exact
+ * loopback prefix counts: a user's own `deepseek-*` model choice is theirs to keep.
+ * @param {object} settings parsed settings.json
+ * @returns {boolean}
+ */
+function unclaimedRouterUrl(settings) {
+  return OUR_URL_SHAPE.test(String(settings?.env?.ANTHROPIC_BASE_URL ?? ''));
+}
+
+/**
  * Parse settings.json, reporting a corrupt file by name instead of a raw SyntaxError.
  * @param {string} file
  * @returns {object}
@@ -152,16 +158,6 @@ export function readSettings(file) {
   }
 }
 
-/**
- * Role-file and delegation-block outcomes computed without writing (for --dry-run).
- * @param {import('./files.js').RoleFileSpec & { names: string[] }} spec
- * @param {string} instructionsFile
- * @returns {{ roles: Record<string, 'written'|'unchanged'|'skipped'>, block: boolean }}
- */
-export function previewRoleFiles(spec, instructionsFile) {
-  return { roles: previewRoles(spec), block: upsertDelegation(readTextOr(instructionsFile)) !== readTextOr(instructionsFile) };
-}
-
 const roleSpec = (claudeHome, pro) => ({
   dir: path.join(claudeHome, 'agents'), extension: '.md', marker: MANAGED_MD, afterFrontmatter: true,
   roles: claudeRoles({ pro }), render: renderClaudeRole, names: CLAUDE_ROLE_NAMES,
@@ -169,7 +165,7 @@ const roleSpec = (claudeHome, pro) => ({
 
 /**
  * Install the Claude Code side.
- * @param {{ claudeHome?: string, port?: number, dryRun?: boolean, pro?: boolean, paths?: import('../paths.js').Paths, env?: NodeJS.ProcessEnv }} [opts]
+ * @param {{ claudeHome?: string, port?: number, dryRun?: boolean, pro?: boolean, token?: string, paths?: import('../paths.js').Paths, env?: NodeJS.ProcessEnv }} [opts]
  * @returns {Promise<{ settingsFile: string, settingsChanged: boolean, backup: string|null, roles: object, claudeMd: boolean, warnings: string[], dryRun: boolean }>}
  */
 export async function installClaude(opts = {}) {
@@ -179,20 +175,23 @@ export async function installClaude(opts = {}) {
   const processEnv = opts.env || process.env;
   const settingsFile = path.join(claudeHome, 'settings.json');
   const allState = readState(paths.stateFile);
-  const { settings: next, state } = applyClaudeSettings(readSettings(settingsFile), port, allState.claude || {});
+  const { settings: next, state } = applyClaudeSettings(readSettings(settingsFile), port, allState.claude || {}, { token: opts.token });
   const nextText = renderSettings(next);
   const report = { settingsFile, settingsChanged: nextText !== readTextOr(settingsFile), backup: null, roles: {}, claudeMd: false, warnings: findWarnings(readSettings(settingsFile), processEnv), dryRun: !!opts.dryRun };
   if (opts.dryRun) {
-    const preview = previewRoleFiles(roleSpec(claudeHome, opts.pro), path.join(claudeHome, 'CLAUDE.md'));
-    return { ...report, roles: preview.roles, claudeMd: preview.block };
+    const claudeMd = path.join(claudeHome, 'CLAUDE.md');
+    return { ...report, roles: previewRoles(roleSpec(claudeHome, opts.pro)), claudeMd: upsertDelegation(readTextOr(claudeMd)) !== readTextOr(claudeMd) };
   }
 
+  if (report.settingsChanged) report.backup = backupFile(settingsFile, paths.backupsDir, 'claude-settings.json');
+  // Record what the managed keys replaced before writing them: a crash between the two writes leaves state
+  // that still reverts exactly, where the reverse order leaves Claude pointed at the router with no record
+  // of the values to put back.
+  writeState(paths.stateFile, { ...allState, claude: state });
   if (report.settingsChanged) {
-    report.backup = backupFile(settingsFile, paths.backupsDir, 'claude-settings.json');
     fs.mkdirSync(claudeHome, { recursive: true });
     fs.writeFileSync(settingsFile, nextText);
   }
-  writeState(paths.stateFile, { ...allState, claude: state });
   report.roles = writeRoleFiles(roleSpec(claudeHome, opts.pro));
   report.claudeMd = upsertDelegationFile(path.join(claudeHome, 'CLAUDE.md'));
   return report;
@@ -210,13 +209,21 @@ export async function uninstallClaude(opts = {}) {
   const allState = readState(paths.stateFile);
   const report = { settingsFile, settingsChanged: false, roles: {}, claudeMd: false };
 
-  if (fs.existsSync(settingsFile) && allState.claude) {
-    const current = fs.readFileSync(settingsFile, 'utf8');
-    const nextText = renderSettings(revertClaudeSettings(JSON.parse(current), allState.claude));
-    if (nextText !== current) {
-      backupFile(settingsFile, paths.backupsDir, 'claude-settings.json');
-      fs.writeFileSync(settingsFile, nextText);
-      report.settingsChanged = true;
+  if (fs.existsSync(settingsFile)) {
+    const settings = readSettings(settingsFile);
+    if (allState.claude) {
+      const restored = revertClaudeSettings(settings, allState.claude);
+      // Compare parsed values, not text, so a file we would not actually change keeps its own formatting.
+      if (JSON.stringify(restored) !== JSON.stringify(settings)) {
+        backupFile(settingsFile, paths.backupsDir, 'claude-settings.json');
+        fs.writeFileSync(settingsFile, renderSettings(restored));
+        report.settingsChanged = true;
+      }
+    } else {
+      // Without state there is no record of the values our keys replaced, so reverting would be a guess.
+      // Refuse instead: the caller stops before removing the service, so Claude keeps working and the user
+      // gets told exactly which keys to remove.
+      if (unclaimedRouterUrl(settings)) throw new Error(`${settingsFile} still routes Claude through agents-switchboard (env.ANTHROPIC_BASE_URL) but ${paths.stateFile} is missing, so the value it replaced cannot be restored. Remove that key by hand (or take the matching file from ${paths.backupsDir}), then re-run \`switchboard uninstall\`. Claude's settings and the running router were left as they are.`);
     }
   }
   const { claude: _recorded, ...remainingState } = allState;

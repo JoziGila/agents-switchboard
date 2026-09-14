@@ -27,12 +27,12 @@ export function modelFromRoutingHint(header) {
 }
 
 /**
- * Pass-through routes require the client's own credential, so a stray local process cannot reach
- * a vendor through the router anonymously. The credential is not validated here; the upstream does that.
+ * Vendor routes also require the client's subscription credential, validated by its upstream. Local
+ * authorization to use the router is checked separately by the server's capability URL.
  */
 export function requireClientAuth(req, res) {
   if (req.headers.authorization || req.headers['x-api-key']) return true;
-  sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'agents-switchboard: pass-through requires the client credential' } });
+  sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'agents-switchboard: this route requires the client credential' } });
   return false;
 }
 

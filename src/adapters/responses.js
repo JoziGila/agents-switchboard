@@ -161,13 +161,29 @@ function cleanInputItem(item, profile) {
 }
 
 /**
+ * Reshape a Codex body built for a responses-lite model (GPT-6 Astra) into the plain form: the
+ * `additional_tools` developer item becomes `tools`. Bodies without that item are returned as is.
+ */
+export function liftResponsesLite(body) {
+  const items = Array.isArray(body.input) ? body.input : [];
+  const lite = items.find((i) => i?.type === 'additional_tools');
+  if (!lite) return body;
+  const tools = [...(Array.isArray(body.tools) ? body.tools : []), ...(Array.isArray(lite.tools) ? lite.tools : [])];
+  return { ...body, tools, input: items.filter((i) => i !== lite) };
+}
+
+/**
  * Rewrite a Codex Responses request for a stateless provider, touching nothing the cache depends on.
+ * The body is lifted first, so the tool names that cross the wire come from the lifted tool list —
+ * `decode` is built from those same tools and is what the SSE relay hands back to Codex.
  * @param {object} body parsed request body
  * @param {ResponsesProfile} [profile]
- * @returns {object} new body
+ * @returns {{ body: object, decode: Map<string, {namespace: string, name: string}>, notes: string[] }}
  */
 export function rewriteResponsesRequest(body, profile = DEEPSEEK_RESPONSES) {
-  const out = { ...body };
+  const lifted = liftResponsesLite(body);
+  const decode = namespacedToolMap(lifted.tools);
+  const out = { ...lifted };
   if (out.model != null) out.model = baseModelId(out.model);
   for (const k of DROP_TOP_LEVEL) delete out[k];
   if (Array.isArray(out.include)) {
@@ -182,7 +198,7 @@ export function rewriteResponsesRequest(body, profile = DEEPSEEK_RESPONSES) {
     out.reasoning = r;
   }
   out.stream = true;
-  return out;
+  return { body: out, decode, notes: [] };
 }
 
 function parseErrorMessage(text) {
@@ -215,9 +231,6 @@ export function mapUpstreamError(status, text, providerName = 'deepseek') {
   return { status, body: envelope('invalid_request_error', message) };
 }
 const envelope = (type, message) => ({ error: { type, code: type, message } });
-
-/** @deprecated use mapUpstreamError */
-export const mapDeepSeekError = (status, text) => mapUpstreamError(status, text, 'deepseek');
 
 /** Pull token counts (and OpenRouter's `cost`) from a `response.completed` event, either usage spelling. */
 export function usageFromResponsesEvent(event) {

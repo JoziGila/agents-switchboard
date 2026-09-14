@@ -50,13 +50,12 @@ export function latestBackup(backupsDir, name) {
  * Write only when the content differs, creating parent directories.
  * @param {string} file
  * @param {string} content
- * @param {number} [mode]
  * @returns {boolean} true when written
  */
-export function writeIfChanged(file, content, mode) {
+export function writeIfChanged(file, content) {
   if (fs.existsSync(file) && fs.readFileSync(file, 'utf8') === content) return false;
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, content, mode ? { mode } : undefined);
+  fs.writeFileSync(file, content);
   return true;
 }
 

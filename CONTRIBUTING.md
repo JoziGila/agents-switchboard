@@ -13,7 +13,7 @@ npm test
 
 `npm run check` syntax-checks every module. `npm test` runs the unit and integration tests; the integration tests start mock OpenAI, Anthropic and DeepSeek upstreams on loopback and never touch the network or your home directory.
 
-To run the router from the checkout: `node bin/switchboard.js serve --port 4242`, then point a client at it with an override only, for example `ANTHROPIC_BASE_URL=http://127.0.0.1:4242/anthropic claude -p "hi"`. This changes nothing on disk.
+To run the router from the checkout: `node bin/switchboard.js serve --port 4242`, then point a client at it with an override only, for example `ANTHROPIC_BASE_URL=http://127.0.0.1:4242/anthropic claude -p "hi"`. This changes nothing on disk. The tokenless `http://127.0.0.1:4242/anthropic` URL is valid only while the dev config has no `access_token`: a tokenless router serves the legacy vendor paths, while one with a token answers those paths with HTTP 400 and reinstall guidance.
 
 ## Layout
 
@@ -24,7 +24,11 @@ To run the router from the checkout: `node bin/switchboard.js serve --port 4242`
 | `src/server.js` | the HTTP server: builds the route context and dispatches by path prefix |
 | `src/routes/` | one module per client (`codex.js`, `claude.js`) plus shared helpers |
 | `src/adapters/` | pure request rewrites for DeepSeek's Responses and Messages dialects, error mapping, the DeepSeek probe |
-| `src/catalog.js` | the injected DeepSeek model entries and the routing predicate |
+| `src/catalog.js` | the bundled DeepSeek entries, generic entries for other provider models, and the picker merge |
+| `src/providers.js` | third-party model providers and the model-id predicate that selects one (`resolveProvider`/`matches`); anything no provider claims passes through |
+| `src/failover.js` | quota-failover detection from the vendors' 429 shapes, and the per-client active state |
+| `src/provenance.js` | which provider produced which reasoning item, so reasoning is replayed only to the provider that can read it |
+| `src/paths.js` | filesystem locations and client detection; everything else derives paths from here |
 | `src/proxy.js`, `src/sse.js` | streaming reverse-proxy primitives and the SSE relay |
 | `src/stats.js`, `src/status-page.js` | counters, cost estimate, request log, status page |
 | `src/install/` | client detection, config edits, role files, login service, secrets |

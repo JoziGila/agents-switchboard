@@ -1,8 +1,9 @@
 // Codex installer: marker-guarded edits to config.toml, role files, and the AGENTS.md delegation block (SPEC §10.1, §10.3).
 import fs from 'node:fs';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { parse } from 'smol-toml';
-import { DEFAULT_PORT } from '../config.js';
+import { DEFAULT_PORT, baseUrlFor } from '../config.js';
 import { resolvePaths } from '../paths.js';
 import { backupFile, latestBackup, readTextOr, writeRoleFiles, removeRoleFiles, previewRoles, upsertDelegationFile, removeDelegationFile } from './files.js';
 import { codexRoles, renderCodexRole, MANAGED_TOML, ROLE_NAMES, upsertDelegation } from './roles.js';
@@ -23,26 +24,18 @@ const MANAGED_TABLES = {
   features: [['multi_agent_v2', 'false']],
 };
 
-/**
- * The `openai_base_url` that keeps ChatGPT auth while routing through the switchboard (SPEC §2).
- * @param {number} port
- * @returns {string}
- */
-export function baseUrlFor(port) {
-  return `http://127.0.0.1:${port}/backend-api/codex`;
-}
-
 const isHeader = (line) => /^\s*\[/.test(line);
 const isTableValue = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const headerName = (line) => line.match(/^\s*\[\[?\s*([^\]]+?)\s*\]\]?/)?.[1].trim() ?? null;
 const tomlValue = (source) => parse(`x = ${source}`).x;
 
 /**
- * Remove every line the installer previously added. Pure.
+ * Remove every line the installer previously added. Line-based and therefore unsafe on its own: the
+ * caller must confirm with `stripManagedChecked` that the removal changed no parsed value. Pure.
  * @param {string} text
  * @returns {string}
  */
-export function stripManaged(text, { collapse = true } = {}) {
+export function stripManaged(text) {
   const out = [];
   let skipUntil = null;
   let dropBlankAfter = false; // insertBaseUrl adds one blank line after its block; take it back with the block
@@ -57,13 +50,50 @@ export function stripManaged(text, { collapse = true } = {}) {
       if (trimmed === '' && out.at(-1)?.trim() === '') continue;
       if (trimmed === '' && out.length === 0) continue;
     }
-    if (trimmed === BLOCK_START) { skipUntil = BLOCK_END; continue; }
+    // The appended-table block is always preceded by the one blank line the installer added with it.
+    if (trimmed === BLOCK_START) { skipUntil = BLOCK_END; if (out.at(-1)?.trim() === '') out.pop(); continue; }
     if (trimmed === URL_START) { skipUntil = URL_END; continue; }
     if (trimmed.endsWith(LINE_TAG) && trimmed !== LINE_TAG) continue;
     out.push(line);
   }
-  const joined = out.join('\n');
-  return collapse ? joined.replace(/\n{3,}/g, '\n\n') : joined;
+  return out.join('\n');
+}
+
+/**
+ * `cfg` with the managed values this strip removed taken out, so it can be compared against the stripped
+ * config. A managed key the user wrote themselves (an accepted preexisting value) survives the strip and
+ * therefore survives here too, or the comparison would reject a config the installer had accepted.
+ * @param {object} cfg parsed text before the strip
+ * @param {object} kept parsed text after the strip
+ */
+function withoutManaged(cfg, kept) {
+  const out = structuredClone(cfg);
+  if (kept.openai_base_url === undefined) delete out.openai_base_url;
+  for (const [table, keys] of Object.entries(MANAGED_TABLES)) {
+    if (!isTableValue(out[table])) continue;
+    for (const [key] of keys) if (kept[table]?.[key] === undefined) delete out[table][key];
+    if (!Object.keys(out[table]).length) delete out[table];
+  }
+  return out;
+}
+
+const UNSAFE = 'config.toml cannot be edited safely: its # agents-switchboard lines do not sit where this'
+  + ' installer put them and removing them would change other settings (a marker line may be inside a'
+  + ' multiline string, or copied by hand). Remove them by hand and re-run.';
+
+/**
+ * Strip our lines and prove, by comparing parsed values, that nothing else moved. Pure.
+ * @param {string} text
+ * @returns {string}
+ */
+function stripManagedChecked(text) {
+  const clean = stripManaged(text);
+  if (clean === text) return clean;
+  const before = text.trim() ? parseNamed(text) : {};
+  let after;
+  try { after = clean.trim() ? parse(clean) : {}; } catch { throw new Error(UNSAFE); }
+  if (!isDeepStrictEqual(after, withoutManaged(before, after))) throw new Error(UNSAFE);
+  return clean;
 }
 
 /**
@@ -101,12 +131,9 @@ function tableRange(lines, name) {
   return { start, end: next === -1 ? lines.length : next };
 }
 
-/** Insert the base-url lines before the first table header, so the key stays top-level. */
+/** Insert the base-url lines at the document start: the one place outside every table and every string. */
 function insertBaseUrl(lines, url) {
-  const urlLines = [URL_START, `openai_base_url = "${url}"`, URL_END];
-  const firstHeader = lines.findIndex(isHeader);
-  if (firstHeader === -1) lines.push(...(lines.length ? [''] : []), ...urlLines);
-  else lines.splice(firstHeader, 0, ...urlLines, '');
+  lines.splice(0, 0, URL_START, `openai_base_url = "${url}"`, URL_END, '');
 }
 
 /** Merge missing managed keys into an existing table (tagged per line) or collect them for the appended block. */
@@ -122,16 +149,28 @@ function mergeTable(lines, table, missing, appended) {
   lines.splice(insertAt, 0, ...rendered);
 }
 
+/** The parsed config the edit is supposed to produce: the user's values plus the managed ones. */
+function expectedConfig(parsed, url) {
+  const want = structuredClone(parsed);
+  want.openai_base_url = url;
+  for (const [table, keys] of Object.entries(MANAGED_TABLES)) {
+    want[table] = { ...(want[table] || {}) };
+    for (const [key, source] of keys) want[table][key] = tomlValue(source);
+  }
+  return want;
+}
+
 /**
  * Produce the config text with the switchboard settings applied. Pure and idempotent.
  * @param {string} original current config.toml text ('' when missing)
  * @param {number} port
+ * @param {{ token?: string }} [opts] capability token the router will require
  * @returns {string}
- * @throws {Error} when the config contains settings the switchboard cannot coexist with
+ * @throws {Error} when the config is invalid, conflicting, or cannot be edited unambiguously
  */
-export function applyCodexConfig(original, port) {
-  const url = baseUrlFor(port);
-  const clean = stripManaged(original);
+export function applyCodexConfig(original, port, opts = {}) {
+  const url = baseUrlFor(port, opts.token, '/backend-api/codex');
+  const clean = stripManagedChecked(original);
   const parsed = clean.trim() ? parseNamed(clean) : {};
   const conflicts = findConflicts(parsed, url, inlineTablesIn(clean));
   if (conflicts.length) {
@@ -149,15 +188,16 @@ export function applyCodexConfig(original, port) {
   }
   if (appended.length) {
     appended.pop();
-    lines.push('', BLOCK_START, ...appended, BLOCK_END);
+    if (lines.at(-1)?.trim() !== '') lines.push('');
+    lines.push(BLOCK_START, ...appended, BLOCK_END);
   }
 
-  const text = lines.join('\n').replace(/\n{3,}/g, '\n\n') + '\n';
-  try {
-    parse(text);
-  } catch (e) {
-    throw new Error(`config.toml could not be merged (${e.message}); the switchboard's lines would leave it invalid. Move [agents] and [features] into standard table headers and re-run.`);
-  }
+  const text = lines.join('\n') + '\n';
+  let got;
+  try { got = parse(text); } catch (e) { throw new Error(`config.toml could not be merged (${e.message}); the switchboard's lines would leave it invalid. Move [agents] and [features] into standard table headers and re-run.`); }
+  // The proof that the line edits landed where TOML means them to: the parsed result is exactly the user's
+  // values plus ours. Anything else (a header inside a multiline string) is refused before any write.
+  if (!isDeepStrictEqual(got, expectedConfig(parsed, url))) throw new Error(UNSAFE);
   return text;
 }
 
@@ -209,7 +249,7 @@ export function findWarnings(text) {
 
 /**
  * Install the Codex side.
- * @param {{ codexHome?: string, port?: number, dryRun?: boolean, pro?: boolean, paths?: import('../paths.js').Paths }} [opts]
+ * @param {{ codexHome?: string, port?: number, dryRun?: boolean, pro?: boolean, token?: string, paths?: import('../paths.js').Paths }} [opts]
  * @returns {Promise<{ configFile: string, configChanged: boolean, backup: string|null, roles: object, agentsMd: boolean, warnings: string[], dryRun: boolean }>}
  */
 export async function installCodex(opts = {}) {
@@ -218,7 +258,7 @@ export async function installCodex(opts = {}) {
   const port = opts.port || DEFAULT_PORT;
   const configFile = path.join(codexHome, 'config.toml');
   const original = readTextOr(configFile);
-  const next = applyCodexConfig(original, port);
+  const next = applyCodexConfig(original, port, { token: opts.token });
   const report = { configFile, configChanged: next !== original, backup: null, roles: {}, agentsMd: false, warnings: findWarnings(original), dryRun: !!opts.dryRun };
   if (opts.dryRun) {
     const agentsMd = path.join(codexHome, 'AGENTS.md');
@@ -240,18 +280,19 @@ export function hasManaged(text) {
   return text.split('\n').some((line) => { const t = line.trim(); return t === BLOCK_START || t === URL_START || (t.endsWith(LINE_TAG) && t !== LINE_TAG); });
 }
 
-/** Strip our lines; if the result is not valid TOML, fall back to the latest backup. */
+/** Strip our lines; when that is unsafe or leaves invalid TOML, fall back to the latest backup. */
 function revertedConfig(original, backupsDir) {
-  let next = stripManaged(original, { collapse: false }).replace(/^\n+/, '').replace(/\n+$/, '');
-  if (next.length) next += '\n';
-  try {
-    parse(next);
-    return { next, restoredFromBackup: null };
-  } catch {
-    // Our line-level strip left invalid TOML (the user edited inside our markers); restore the copy we took.
-    const backup = latestBackup(backupsDir, 'codex-config.toml');
-    return backup ? { next: fs.readFileSync(backup, 'utf8'), restoredFromBackup: backup } : { next, restoredFromBackup: null };
+  let stripped = null;
+  try { stripped = stripManagedChecked(original).replace(/^\n+/, '').replace(/\n+$/, ''); } catch { /* unsafe: use the backup */ }
+  if (stripped !== null) {
+    try {
+      if (stripped.trim()) parse(stripped);
+      return { next: stripped.length ? stripped + '\n' : '', restoredFromBackup: null };
+    } catch { /* our lines came out of a file a hand-edit had already broken: use the backup */ }
   }
+  const backup = latestBackup(backupsDir, 'codex-config.toml');
+  if (backup) return { next: fs.readFileSync(backup, 'utf8'), restoredFromBackup: backup };
+  throw new Error(`${UNSAFE} No backup of config.toml exists to restore instead, so it was left untouched; uninstall the service by hand if you need it stopped.`);
 }
 
 /**

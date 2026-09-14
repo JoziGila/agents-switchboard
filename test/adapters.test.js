@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rewriteResponsesRequest, mapDeepSeekError, usageFromResponsesEvent } from '../src/adapters/responses.js';
+import { rewriteResponsesRequest, usageFromResponsesEvent } from '../src/adapters/responses.js';
 import { rewriteMessagesRequest, hasUnsignedThinking, stripUnsignedThinking, normalizeSseData } from '../src/adapters/messages.js';
-import { isDeepSeekModel, mergeModels, rewriteEtag, deepseekEntries } from '../src/catalog.js';
+import { entriesFor, mergeModels, rewriteEtag } from '../src/catalog.js';
+import { buildProviders } from '../src/providers.js';
 import * as adaptersForAgentMessage from '../src/adapters/responses.js';
 import * as messagesForUsage from '../src/adapters/messages.js';
 
@@ -26,7 +27,7 @@ const codexBody = {
 };
 
 test('responses adapter strips what DeepSeek cannot use and keeps the prefix', () => {
-  const out = rewriteResponsesRequest(codexBody);
+  const { body: out } = rewriteResponsesRequest(codexBody);
   for (const k of ['store', 'prompt_cache_key', 'text', 'client_metadata', 'include']) assert.ok(!(k in out), k);
   assert.equal(out.instructions, 'You are Codex');
   assert.deepEqual(out.reasoning, { effort: 'max' });
@@ -36,20 +37,20 @@ test('responses adapter strips what DeepSeek cannot use and keeps the prefix', (
   assert.equal(out.input[1].summary[0].text, 'thought');
   assert.deepEqual(out.tools.map((t) => t.name), ['exec_command', 'apply_patch', 'mcp__x__js']);
   assert.equal(codexBody.include.length, 1, 'input not mutated');
-  assert.deepEqual(rewriteResponsesRequest(codexBody), out, 'deterministic');
+  assert.deepEqual(rewriteResponsesRequest(codexBody).body, out, 'deterministic');
 });
 
 test('responses adapter maps efforts', () => {
   for (const [from, to] of [['low', 'low'], ['medium', 'high'], ['high', 'high'], ['xhigh', 'max'], ['ultra', 'max'], ['weird', 'high']]) {
-    assert.equal(rewriteResponsesRequest({ reasoning: { effort: from } }).reasoning.effort, to);
+    assert.equal(rewriteResponsesRequest({ reasoning: { effort: from } }).body.reasoning.effort, to);
   }
 });
 
 test('deepseek error mapping', () => {
-  assert.equal(mapDeepSeekError(401, '{"error":{"message":"bad key"}}').status, 400, 'never 401 to the client');
-  assert.equal(mapDeepSeekError(429, 'slow').body.error.type, 'rate_limit_exceeded');
-  assert.equal(mapDeepSeekError(503, 'x').body.error.type, 'server_error');
-  assert.equal(mapDeepSeekError(400, 'x').status, 400);
+  assert.equal(mapUpstreamError(401, '{"error":{"message":"bad key"}}').status, 400, 'never 401 to the client');
+  assert.equal(mapUpstreamError(429, 'slow').body.error.type, 'rate_limit_exceeded');
+  assert.equal(mapUpstreamError(503, 'x').body.error.type, 'server_error');
+  assert.equal(mapUpstreamError(400, 'x').status, 400);
 });
 
 test('responses usage reads both spellings', () => {
@@ -103,15 +104,12 @@ test('usage normalisation fills anthropic cache fields', () => {
 });
 
 test('catalog helpers', () => {
-  assert.equal(isDeepSeekModel('deepseek-flash[1m]'), true);
-  assert.equal(isDeepSeekModel('gpt-5.5'), false);
-  assert.equal(isDeepSeekModel(null), false);
-  const entries = deepseekEntries(['deepseek-flash']);
-  assert.equal(entries.length, 1);
+  const entries = entriesFor(buildProviders({ upstream: { deepseek: { base_url: 'https://api.deepseek.com', models: ['deepseek-flash'] } } }, async () => 'k'));
+  assert.deepEqual(entries.map((e) => e.slug), ['deepseek-flash']);
   const merged = mergeModels({ models: [{ slug: 'gpt-5.5', multi_agent_version: 'v2' }, { slug: 'deepseek-flash', display_name: 'already' }] }, entries);
   assert.deepEqual(merged.models.map((m) => m.slug), ['gpt-5.5', 'deepseek-flash']);
   assert.equal(merged.models[0].multi_agent_version, 'v1', 'parent models are served as v1 so spawn payloads stay plaintext');
-  assert.equal(mergeModels({ models: [{ slug: 'g', multi_agent_version: 'v2' }] }, [], { forceMultiAgentV1: false }).models[0].multi_agent_version, 'v2');
+  assert.equal(merged.models[1].display_name, 'already', 'the upstream entry wins over the injected one');
   assert.equal(rewriteEtag('"abc"', 'h1'), '"abc+sbh1"');
   assert.equal(rewriteEtag(undefined, 'h1'), '"sbh1"');
 });
@@ -131,12 +129,12 @@ test('effort ladders: three-level and four-level mapping', () => {
 
 test('responses: openrouter profile keeps 4-level efforts, drops custom tools, keeps empty output', () => {
   const body = { model: 'qwen/qwen3-coder[1m]', reasoning: { effort: 'xhigh' }, tools: [{ type: 'custom', name: 'apply_patch' }, { type: 'function', name: 'f' }], input: [{ type: 'function_call_output', call_id: 'c', output: '' }] };
-  const out = rewriteResponsesRequest(body, OPENROUTER_RESPONSES);
+  const { body: out } = rewriteResponsesRequest(body, OPENROUTER_RESPONSES);
   assert.equal(out.model, 'qwen/qwen3-coder');
   assert.equal(out.reasoning.effort, 'high');
   assert.deepEqual(out.tools.map((t) => t.name), ['f']);
   assert.equal(out.input[0].output, '', 'no placeholder on openrouter');
-  const ds = rewriteResponsesRequest(body, DEEPSEEK_RESPONSES);
+  const { body: ds } = rewriteResponsesRequest(body, DEEPSEEK_RESPONSES);
   assert.equal(ds.reasoning.effort, 'max');
   assert.deepEqual(ds.tools.map((t) => t.name), ['apply_patch', 'f']);
   assert.equal(ds.input[0].output, EMPTY_OUTPUT_PLACEHOLDER);
@@ -150,13 +148,13 @@ test('responses: assistant content is never empty; empty tool output gets the pl
     { type: 'function_call_output', call_id: 'c1', output: [] },
     { type: 'function_call_output', call_id: 'c2', output: 'real' },
   ] };
-  const out = rewriteResponsesRequest(frozen(body));
+  const { body: out } = rewriteResponsesRequest(frozen(body));
   assert.deepEqual(out.input[0].content, [{ type: 'output_text', text: '' }]);
   assert.deepEqual(out.input[1].content, [{ type: 'output_text', text: '' }]);
   assert.deepEqual(out.input[2].content, [], 'user messages untouched');
   assert.equal(out.input[3].output, EMPTY_OUTPUT_PLACEHOLDER);
   assert.equal(out.input[4].output, 'real');
-  assert.deepEqual(rewriteResponsesRequest(out), out, 'idempotent');
+  assert.deepEqual(rewriteResponsesRequest(out).body, out, 'idempotent');
 });
 
 test('responses: encrypted_content kept only when the profile vouches for the item', () => {
@@ -166,7 +164,7 @@ test('responses: encrypted_content kept only when the profile vouches for the it
     { type: 'reasoning', id: 'rs_text', encrypted_content: 'E3', summary: [{ type: 'summary_text', text: 'kept text' }] },
   ] };
   const profile = { ...OPENROUTER_RESPONSES, keepEncryptedContent: (i) => i.id === 'rs_ours' };
-  const out = rewriteResponsesRequest(frozen(body), profile);
+  const { body: out } = rewriteResponsesRequest(frozen(body), profile);
   assert.deepEqual(out.input.map((i) => i.id), ['rs_ours', 'rs_text']);
   assert.equal(out.input[0].encrypted_content, 'E1');
   assert.ok(!('encrypted_content' in out.input[1]));
@@ -216,7 +214,6 @@ test('error mapping never emits 401/402/403 and parses the OpenRouter envelope',
   assert.equal(or.body.error.message, 'openrouter: Rate limit exceeded [rate_limit_exceeded, provider DeepSeek]');
   assert.equal(mapUpstreamError(503, 'down').body.error.type, 'server_error');
   assert.equal(mapUpstreamError(400, 'bad').status, 400);
-  assert.equal(mapDeepSeekError(401, 'x').status, 400, 'alias still works');
 });
 
 test('usage cost and reasoning ids from events', () => {
@@ -232,7 +229,7 @@ test('codex agent_message items become plain user messages; encrypted payloads a
   const { rewriteResponsesRequest } = adaptersForAgentMessage;
   const plain = { type: 'agent_message', id: 'amsg_1', author: '/root', recipient: '/root/x', content: [{ type: 'input_text', text: 'Message Type: NEW_TASK\nPayload:\nwhat is 2+2?' }] };
   const enc = { type: 'agent_message', id: 'amsg_2', author: '/root', recipient: '/root/x', content: [{ type: 'input_text', text: 'Message Type: NEW_TASK\nPayload:\n' }, { type: 'encrypted_content', encrypted_content: 'gAAAA' }] };
-  const out = rewriteResponsesRequest({ model: 'deepseek-flash', input: [plain, enc] });
+  const { body: out } = rewriteResponsesRequest({ model: 'deepseek-flash', input: [plain, enc] });
   assert.equal(out.input[0].type, 'message');
   assert.equal(out.input[0].role, 'user');
   assert.deepEqual(out.input[0].content, [{ type: 'input_text', text: 'Message Type: NEW_TASK\nPayload:\nwhat is 2+2?' }]);
@@ -253,8 +250,10 @@ test('responses usage is normalised to the native shape for Codex', () => {
 test('namespaced tools are encoded on the wire and decoded back into namespace + name', () => {
   const { rewriteResponsesRequest, namespacedToolMap, codexSseMapper } = adaptersForAgentMessage;
   const tools = [{ type: 'namespace', name: 'collaboration', description: 'Agents', tools: [{ type: 'function', name: 'spawn_agent', description: 'Spawn', parameters: {} }] }, { type: 'namespace', name: 'mcp__cua_repl', tools: [{ type: 'function', name: 'js' }] }, { type: 'function', name: 'exec_command' }];
-  const out = rewriteResponsesRequest({ model: 'deepseek-flash', tools, input: [{ type: 'function_call', name: 'spawn_agent', namespace: 'collaboration', call_id: 'c1', arguments: '{}' }] });
+  const { body: out, decode, notes } = rewriteResponsesRequest({ model: 'deepseek-flash', tools, input: [{ type: 'function_call', name: 'spawn_agent', namespace: 'collaboration', call_id: 'c1', arguments: '{}' }] });
   assert.deepEqual(out.tools.map((t) => t.name), ['collaboration__spawn_agent', 'mcp__cua_repl__js', 'exec_command']);
+  assert.deepEqual([...decode.entries()].sort(), [...namespacedToolMap(tools).entries()].sort(), 'decode is the map of the tools the provider was given');
+  assert.deepEqual(notes, []);
   assert.match(out.tools[0].description, /^\[collaboration\] Spawn/);
   assert.equal(out.input[0].name, 'collaboration__spawn_agent');
   assert.ok(!('namespace' in out.input[0]));
@@ -266,6 +265,26 @@ test('namespaced tools are encoded on the wire and decoded back into namespace +
   const j = JSON.parse(done);
   assert.equal(j.response.output[0].name, 'exec_command');
   assert.equal(j.response.usage.total_tokens, 2);
+});
+
+test('liftResponsesLite moves additional_tools into tools', () => {
+  const { liftResponsesLite } = adaptersForAgentMessage;
+  const body = { input: [{ type: 'additional_tools', role: 'developer', tools: [{ type: 'function', name: 'a' }] }, { type: 'message', role: 'user', content: [] }], tools: [{ type: 'function', name: 'b' }] };
+  const out = liftResponsesLite(body);
+  assert.deepEqual(out.tools.map((t) => t.name), ['b', 'a']);
+  assert.equal(out.input.length, 1);
+  assert.equal(liftResponsesLite({ input: [] }).tools, undefined);
+});
+
+test('a responses-lite body is lifted inside the rewrite, and decode covers its namespaced tools', () => {
+  const { rewriteResponsesRequest, codexSseMapper } = adaptersForAgentMessage;
+  const body = { model: 'gpt-6-astra', input: [{ type: 'additional_tools', role: 'developer', tools: [{ type: 'namespace', name: 'collaboration', tools: [{ type: 'function', name: 'spawn_agent' }] }] }] };
+  const { body: out, decode } = rewriteResponsesRequest(body);
+  assert.deepEqual(out.tools.map((t) => t.name), ['collaboration__spawn_agent'], 'the lifted tools are what crosses the wire');
+  assert.ok(!out.input.some((i) => i.type === 'additional_tools'));
+  assert.deepEqual(decode.get('collaboration__spawn_agent'), { namespace: 'collaboration', name: 'spawn_agent' });
+  const decoded = codexSseMapper(decode)('{"type":"response.output_item.added","item":{"type":"function_call","name":"collaboration__spawn_agent","call_id":"c1","arguments":""}}');
+  assert.deepEqual(JSON.parse(decoded).item, { type: 'function_call', name: 'spawn_agent', namespace: 'collaboration', call_id: 'c1', arguments: '' });
 });
 
 test('anthropic usage: message_delta with only output_tokens does not zero earlier counts; input is the full prompt', () => {
@@ -287,7 +306,7 @@ test('reasoning from another provider is dropped; the provider\'s own is replaye
     { type: 'reasoning', id: 'rs_ds_1', summary: [{ type: 'summary_text', text: 'ds thought' }] },
     { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
   ];
-  const out = rewriteResponsesRequest({ model: 'deepseek-flash', input }, profile);
+  const { body: out } = rewriteResponsesRequest({ model: 'deepseek-flash', input }, profile);
   assert.deepEqual(out.input.map((i) => i.id ?? i.type), ['rs_ds_1', 'message']);
-  assert.equal(rewriteResponsesRequest({ model: 'deepseek-flash', input }, DEEPSEEK_RESPONSES).input.length, 3, 'without a provenance hook nothing is dropped');
+  assert.equal(rewriteResponsesRequest({ model: 'deepseek-flash', input }, DEEPSEEK_RESPONSES).body.input.length, 3, 'without a provenance hook nothing is dropped');
 });

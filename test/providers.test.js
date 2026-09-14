@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildProviders, resolveProvider, stripSuffix } from '../src/providers.js';
+import { buildProviders, resolveProvider } from '../src/providers.js';
+import { baseModelId } from '../src/catalog.js';
 import { createProvenance } from '../src/provenance.js';
 import { genericEntry, entriesFor } from '../src/catalog.js';
 
@@ -19,7 +20,7 @@ test('model ids select providers; everything else passes through', () => {
   assert.equal(name('claude-sonnet-5'), null);
   assert.equal(name(''), null);
   assert.equal(name(undefined), null);
-  assert.equal(stripSuffix('x[1m]'), 'x');
+  assert.equal(baseModelId('x[1m]'), 'x');
 });
 
 test('provider auth headers per dialect', () => {
@@ -38,6 +39,19 @@ test('catalog entries: bundled for deepseek slugs, generic with overrides for th
   assert.equal(entries[1].apply_patch_tool_type, 'function');
   assert.equal(entries[2].display_name, 'deepseek-v4.1-flash');
   assert.equal(genericEntry('a/b', 'openrouter').description, 'a model via openrouter');
+});
+
+test('provider.endpoint joins baseUrl and dialect path without dropping a path segment already on baseUrl', () => {
+  const [ds, or] = providers;
+  // OpenRouter's base_url carries a path (/api): a naive new URL(messagesPath, baseUrl) would discard it.
+  assert.equal(or.endpoint('messages').href, 'https://openrouter.ai/api/v1/messages');
+  assert.equal(or.endpoint('responses').href, 'https://openrouter.ai/api/v1/responses');
+  // DeepSeek's base_url has no path: behavior is unchanged, no regression.
+  assert.equal(ds.endpoint('messages').href, 'https://api.deepseek.com/anthropic/v1/messages');
+  assert.equal(ds.endpoint('responses').href, 'https://api.deepseek.com/responses');
+  // A trailing slash on baseUrl must not produce a doubled slash at the join.
+  const trailing = buildProviders({ upstream: { openrouter: { base_url: 'https://openrouter.ai/api/', models: [] } } }, async () => 'k')[0];
+  assert.equal(trailing.endpoint('messages').href, 'https://openrouter.ai/api/v1/messages');
 });
 
 test('provenance is bounded and per provider', () => {

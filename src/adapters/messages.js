@@ -120,7 +120,6 @@ export function normalizeSseData(data) {
   } catch { return data; }
 }
 
-/** Token counts (and OpenRouter's `cost`) from a `message_delta` / `message_start` payload. */
 /**
  * Token counts from a `message_start` / `message_delta` payload. Only fields present in the event are
  * returned, so a `message_delta` that carries just `output_tokens` never zeroes the earlier counts.

@@ -23,13 +23,13 @@ Verified on 2026-09-14 with Codex 0.154 and Claude Code 2.1.270: an explorer sub
 Neither client can pick a provider per subagent, but both can be pointed at a different base URL while keeping subscription auth. The switchboard is a loopback router at that URL.
 
 ```
-Codex ── openai_base_url ──▶ 127.0.0.1:4141/backend-api/codex ──┬─ gpt-*      ─▶ chatgpt.com (unchanged, your ChatGPT token)
-                                                                └─ deepseek-* ─▶ api.deepseek.com/responses
-Claude Code ── ANTHROPIC_BASE_URL ──▶ 127.0.0.1:4141/anthropic ──┬─ claude-*   ─▶ api.anthropic.com (unchanged, your claude.ai token)
-                                                                 └─ deepseek-* ─▶ api.deepseek.com/anthropic/v1/messages
+Codex ── openai_base_url ──▶ 127.0.0.1:4141/_switchboard/<local-token>/backend-api/codex ──┬─ gpt-*      ─▶ chatgpt.com (unchanged, your ChatGPT token)
+                                                                                           └─ deepseek-* ─▶ api.deepseek.com/responses
+Claude Code ── ANTHROPIC_BASE_URL ──▶ 127.0.0.1:4141/_switchboard/<local-token>/anthropic ──┬─ claude-*   ─▶ api.anthropic.com (unchanged, your claude.ai token)
+                                                                                            └─ deepseek-* ─▶ api.deepseek.com/anthropic/v1/messages
 ```
 
-Requests are routed by model. GPT and Claude traffic passes through untouched, including every header and the compressed body. DeepSeek-bound requests get a small, deterministic rewrite (fields DeepSeek does not support are removed, nothing is reordered) so DeepSeek's prefix cache keeps hitting. Full design, with references into the Codex source and the Claude Code gateway docs, in [SPEC.md](SPEC.md).
+Requests are routed by model. GPT and Claude traffic passes through untouched, including every header and the compressed body. DeepSeek-bound requests get a small, deterministic rewrite (fields DeepSeek does not support are removed, nothing is reordered) so DeepSeek's prefix cache keeps hitting. The local token in the URL is a loopback capability, minted by the installer and stored in `~/.agents-switchboard/config.toml`; it prevents another local OS user from spending your stored provider keys with `Bearer x`. Full design, with references into the Codex source and the Claude Code gateway docs, in [SPEC.md](SPEC.md).
 
 ## OpenRouter too
 
@@ -41,20 +41,20 @@ Requirements: Node 22.15+, Codex and/or Claude Code signed in with your subscrip
 
 `node bin/switchboard.js install` does the following, in this order, and stops at the first failure without touching your clients:
 
-1. Detects Codex and Claude Code and asks for the DeepSeek key (stored in the OS keychain, never in a file).
+1. Detects Codex and Claude Code, creates or preserves the local router capability token, and asks for the DeepSeek key (stored in the OS keychain when available).
 2. Optionally asks for an OpenRouter key. Probes each provider on both API dialects.
 3. Registers and starts the login service (launchd on macOS, systemd user unit on Linux, scheduled task on Windows) and waits for `/switchboard/health`.
-4. Completes a real turn per client **through** the router using only a command-line override, so nothing on disk has changed yet.
+4. Completes a real turn per client **through** the router using private temporary override files, so no client config has changed yet.
 5. Only then edits `~/.codex/config.toml` and `~/.claude/settings.json` (backed up first), writes the role files, and appends a delegation policy to `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`. Both configs are pre-flighted before step 3, so a conflict or a corrupt file stops the install with nothing changed.
 6. Runs `doctor`.
 
-Restart the desktop apps once so they refetch models. Sessions already open keep their old connection.
+Restart the desktop apps once so they refetch models. Sessions already open keep their old connection when the token already existed; when `install` mints a new one, restart every open Codex and Claude Code session (Claude Code reloads `settings.json` live, Codex desktop does not).
 
 What the clients end up with:
 
 | Codex (`~/.codex/config.toml`) | Claude Code (`~/.claude/settings.json`) |
 |---|---|
-| `openai_base_url` → the router | `env.ANTHROPIC_BASE_URL` → the router |
+| `openai_base_url` → the protected router URL | `env.ANTHROPIC_BASE_URL` → the protected router URL |
 | `[agents] default_subagent_model = "deepseek-flash"` | `env.CLAUDE_CODE_SUBAGENT_MODEL = "deepseek-flash[1m]"` |
 | `[features] multi_agent_v2 = false` | `env.ANTHROPIC_CUSTOM_MODEL_OPTION*` (picker entry) |
 | `~/.codex/agents/{explorer,worker,reviewer,senior}.toml` | `~/.claude/agents/{explorer,worker,reviewer,senior,Explore,Plan}.md` (the last two replace Claude's built-ins, which otherwise ignore the subagent model) |
@@ -68,16 +68,17 @@ What the clients end up with:
 | `test` | Spawn a real explorer in each client and prove from the router log that it ran on DeepSeek. |
 | `status` | Routes, failover state, per-model and per-role tokens, cache hit ratio, estimated spend. Also at http://127.0.0.1:4141/switchboard/ |
 | `logs [-n N]` | Tail the request log (metadata only). |
-| `roles [--pro] [--reset]` | Rewrite the role files. |
+| `roles [--pro]` | Rewrite the role files. |
 | `failover on\|off\|reset` | Control quota failover. |
 | `uninstall [--purge]` | Restore both clients and remove the service; a config the installer never touched is left byte-identical. `--purge` also deletes every provider's keychain entry. |
 
 ## Safety
 
 - Loopback only. Your ChatGPT token goes only to `chatgpt.com`, your claude.ai token only to `api.anthropic.com`, your DeepSeek key only to `api.deepseek.com`.
-- The router never answers a client with HTTP 401, because both clients treat that as an expired login and start a token refresh.
+- Vendor routes require the local capability URL created by `switchboard install`; legacy unprotected router paths fail with reinstall guidance.
+- Router-owned local auth failures and provider-key failures use HTTP 400, because both clients treat local 401s as expired subscription logins. Real upstream subscription 401s pass through unchanged so native refresh still works.
 - The installer never points a client at a router it has not just proven healthy with a real round trip.
-- Bodies are streamed, never stored. The log holds metadata only. See [SECURITY.md](SECURITY.md).
+- Bodies are streamed, never stored. The log holds metadata only and does not include the local capability token. See [SECURITY.md](SECURITY.md).
 
 ## Troubleshooting
 
@@ -88,8 +89,8 @@ What the clients end up with:
 
 ## Status and roadmap
 
-Phase 1 is complete and verified end to end. Phase 2 adds quota failover and the cost dashboard; phase 3 splices WebSockets through for GPT traffic and re-enables Codex multi-agent v2 after verification. Details in [SPEC.md §16](SPEC.md#16-roadmap). Not yet on npm; run from a checkout.
+Phase 1 is complete and verified end to end. Phase 2 is shipped: quota failover for both clients, provider-reported cost, and cache hit ratios per role. Phase 3 splices WebSockets through for GPT traffic and re-enables Codex multi-agent v2 after verification. Details in [SPEC.md §16](SPEC.md#16-roadmap). Not yet on npm; run from a checkout.
 
 ## Contributing and license
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). MIT.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the [docs index](docs/README.md). MIT.

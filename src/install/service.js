@@ -16,6 +16,34 @@ const xml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, 
 /** Swallow the error from a command whose failure means "already in the desired state". */
 const ignoreFailure = () => {};
 
+/** `launchctl` older than the bootstrap/bootout subcommands answers with usage text; that alone justifies `load`. */
+const UNSUPPORTED_LAUNCHCTL = /Usage|Unrecognized|unknown subcommand/i;
+/** The stderr an execFile failure carries, plus its message (which repeats it). */
+const launchctlSaid = (e) => `${e?.stderr ?? ''}${e?.message ?? ''}`;
+
+/**
+ * Wait until `bootout` has actually unloaded the job: launchctl returns before launchd finishes, and a
+ * bootstrap issued into that window fails with "Bootstrap failed: 5: Input/output error" or "already loaded".
+ * `launchctl print` exits non-zero once the job is gone; give up after ~5 s and let bootstrap decide.
+ */
+async function waitForUnload(exec, target, label) {
+  const until = Date.now() + 5000;
+  while (Date.now() < until) {
+    try { await exec('launchctl', ['print', `${target}/${label}`], { timeout: 5000 }); } catch { return; }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+/** Bootstrap the job, retrying a raced-out failure up to 3 times; an unsupported subcommand throws immediately. */
+async function bootstrapJob(exec, target, file) {
+  for (let retries = 0; ; retries++) {
+    try { return await exec('launchctl', ['bootstrap', target, file]); } catch (e) {
+      if (retries >= 3 || UNSUPPORTED_LAUNCHCTL.test(launchctlSaid(e))) throw e;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+}
+
 /** `<key>NAME</key><string>VALUE</string>` lines for a plist EnvironmentVariables dict. */
 const plistEnv = (env) => Object.entries(env).map(([k, v]) => `    <key>${xml(k)}</key><string>${xml(v)}</string>`).join('\n');
 /** `Environment=NAME=VALUE` lines for a systemd unit, quoted so spaces and quotes survive. */
@@ -95,6 +123,7 @@ export function renderWindowsWrapper({ nodePath, entryPath, envFile }) {
  * @returns {Promise<{ kind: 'launchd'|'systemd'|'schtasks', file: string|null }>}
  */
 export async function installService(opts) {
+  const exec = opts.run || run;
   const nodePath = opts.nodePath || process.execPath;
   const home = opts.home || os.homedir();
   const platform = opts.platform || process.platform;
@@ -107,13 +136,16 @@ export async function installService(opts) {
     case 'darwin': {
       const file = plistPath(home);
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      await run('launchctl', ['bootout', `${launchdTarget()}/${LABEL}`]).catch(ignoreFailure); // not loaded yet
+      const target = launchdTarget();
+      await exec('launchctl', ['bootout', `${target}/${LABEL}`]).catch(ignoreFailure); // not loaded yet
       fs.writeFileSync(file, renderPlist(rendering), { mode: 0o600 });
+      await waitForUnload(exec, target, LABEL);
       try {
-        await run('launchctl', ['bootstrap', launchdTarget(), file]);
-      } catch {
-        // Older launchctl without bootstrap/bootout.
-        await run('launchctl', ['load', '-w', file]);
+        await bootstrapJob(exec, target, file);
+      } catch (e) {
+        // Only launchctl too old for bootstrap/bootout may fall back to `load`.
+        if (!UNSUPPORTED_LAUNCHCTL.test(launchctlSaid(e))) throw new Error(`launchctl bootstrap failed: ${launchctlSaid(e).trim()}`, { cause: e });
+        await exec('launchctl', ['load', '-w', file]);
       }
       return { kind: 'launchd', file };
     }
@@ -176,11 +208,14 @@ export async function uninstallService(opts = {}) {
   const platform = opts.platform || process.platform;
   switch (platform) {
     case 'darwin': {
+      const exec = opts.run || run;
       const file = plistPath(home);
       const removed = fs.existsSync(file);
-      await run('launchctl', ['bootout', `${launchdTarget()}/${LABEL}`]).catch(ignoreFailure); // not loaded
+      const target = launchdTarget();
+      await exec('launchctl', ['bootout', `${target}/${LABEL}`]).catch(ignoreFailure); // not loaded
       if (removed) {
-        await run('launchctl', ['unload', file]).catch(ignoreFailure); // legacy launchctl fallback
+        await waitForUnload(exec, target, LABEL); // unlink only once launchd has let the job go
+        await exec('launchctl', ['unload', file]).catch(ignoreFailure); // legacy launchctl fallback
         fs.unlinkSync(file);
       }
       return { removed };

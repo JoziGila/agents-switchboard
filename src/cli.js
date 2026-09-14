@@ -11,7 +11,7 @@ usage: switchboard <command> [options]
   test                                              spawn a real subagent on each client and prove the route
   status                                            routes, failover state, tokens, cache hit ratio, spend
   logs [-n N]                                       tail the request log
-  roles [--pro] [--reset]                           rewrite role files
+  roles [--pro]                                     rewrite role files
   failover on|off|reset                             control quota failover
 `;
 
@@ -64,9 +64,4 @@ async function serve(opts) {
   log(`listening on http://${host}:${server.address().port} (codex: /backend-api/codex, claude: /anthropic, status: /switchboard/)`);
   await new Promise((resolve) => { for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => server.close(resolve)); });
   return 0;
-}
-
-export function splitListen(listen) {
-  const i = listen.lastIndexOf(':');
-  return [listen.slice(0, i) || '127.0.0.1', Number(listen.slice(i + 1)) || 4141];
 }

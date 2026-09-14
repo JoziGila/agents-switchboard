@@ -5,6 +5,34 @@ const number = (n) => (n == null ? '-' : typeof n === 'number' && !Number.isInte
 const row = (cells) => cells.map(([value, width, align]) => (align === 'left' ? String(value).padEnd(width) : number(value).padStart(width))).join(' ');
 
 /**
+ * `failover.active` is keyed by client — `{ codex: { until, since, reason }, claude: {...} }` — so an
+ * empty object means no failover and each entry is one client. Rendering the object itself would print
+ * ACTIVE for `{}` and `[object Object]` for the timestamp.
+ */
+function activeLabel(active) {
+  return Object.entries(active ?? {}).map(([client, a]) => ` · ${client} ACTIVE until ${a.until} (${a.reason})`).join('');
+}
+
+/** Render the human-readable status view. Pure: `s` is the `/switchboard/status` JSON. */
+export function formatStatus(s) {
+  const lines = [
+    `agents-switchboard on ${s.listen} · up ${s.uptimeSec}s · DeepSeek pricing now: ${s.peakNow ? 'peak' : 'off-peak'}`,
+    `DeepSeek models: ${s.deepseekModels.join(', ')}`,
+    `failover: ${s.failover.enabled ? `enabled → ${s.failover.model}` : 'disabled'}${activeLabel(s.failover.active)}`,
+    `in flight: ${(s.inflight ?? []).length}${(s.inflight ?? []).map((r) => ` · ${r.client}/${r.model}${r.role ? ` (${r.role})` : ''} ${Math.round(r.ageMs / 1000)}s`).join('')} · stalled: ${s.stalled ?? 0}`,
+    '',
+    'model                requests     input    cached    output  hit-ratio   est.USD',
+  ];
+  for (const [model, v] of Object.entries(s.models)) lines.push(row([[model, 20, 'left'], [v.requests, 8], [v.input, 9], [v.cached, 9], [v.output, 9], [v.cacheHitRatio, 10], [v.usd, 9]]));
+  if (!Object.keys(s.models).length) lines.push('  (no requests yet)');
+  lines.push('', 'role                 requests     input    cached  hit-ratio');
+  for (const [role, v] of Object.entries(s.roles)) lines.push(row([[role, 20, 'left'], [v.requests, 8], [v.input, 9], [v.cached, 9], [v.cacheHitRatio, 10]]));
+  lines.push('', 'upstream             last ok                    last error');
+  for (const [name, v] of Object.entries(s.upstreams)) lines.push(`${name.padEnd(20)} ${String(v.lastOk ?? '-').padEnd(26)} ${v.lastError ?? '-'}`);
+  return lines.join('\n') + '\n';
+}
+
+/**
  * @param {{ port?: string|number, json?: boolean }} [opts]
  * @returns {Promise<number>} exit code
  */
@@ -23,19 +51,6 @@ export async function status(opts = {}) {
     process.stdout.write(JSON.stringify(s, null, 2) + '\n');
     return 0;
   }
-  const lines = [
-    `agents-switchboard on ${s.listen} · up ${s.uptimeSec}s · DeepSeek pricing now: ${s.peakNow ? 'peak' : 'off-peak'}`,
-    `DeepSeek models: ${s.deepseekModels.join(', ')}`,
-    `failover: ${s.failover.enabled ? `enabled → ${s.failover.model}` : 'disabled'}${s.failover.active ? ` · ACTIVE until ${s.failover.active}` : ''}`,
-    '',
-    'model                requests     input    cached    output  hit-ratio   est.USD',
-  ];
-  for (const [model, v] of Object.entries(s.models)) lines.push(row([[model, 20, 'left'], [v.requests, 8], [v.input, 9], [v.cached, 9], [v.output, 9], [v.cacheHitRatio, 10], [v.usd, 9]]));
-  if (!Object.keys(s.models).length) lines.push('  (no requests yet)');
-  lines.push('', 'role                 requests     input    cached  hit-ratio');
-  for (const [role, v] of Object.entries(s.roles)) lines.push(row([[role, 20, 'left'], [v.requests, 8], [v.input, 9], [v.cached, 9], [v.cacheHitRatio, 10]]));
-  lines.push('', 'upstream             last ok                    last error');
-  for (const [name, v] of Object.entries(s.upstreams)) lines.push(`${name.padEnd(20)} ${String(v.lastOk ?? '-').padEnd(26)} ${v.lastError ?? '-'}`);
-  process.stdout.write(lines.join('\n') + '\n');
+  process.stdout.write(formatStatus(s));
   return 0;
 }

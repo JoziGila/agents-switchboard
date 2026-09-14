@@ -11,17 +11,6 @@ export function baseModelId(model) {
   return String(model ?? '').replace(/\[1m\]$/i, '');
 }
 
-/** A model is DeepSeek-bound when its id (sans suffix) starts with `deepseek-`. */
-export function isDeepSeekModel(model) {
-  return /^deepseek-/i.test(baseModelId(model));
-}
-
-/** Bundled DeepSeek catalog entries restricted to the configured slugs. */
-export function deepseekEntries(slugs) {
-  const wanted = new Set(slugs ?? bundled.models.map((m) => m.slug));
-  return bundled.models.filter((m) => wanted.has(m.slug));
-}
-
 /**
  * A picker entry for a model a provider serves but ships no catalog for (OpenRouter ids). Derived from
  * DeepSeek's Flash entry: plain function tools, function-style apply_patch, no responses-lite, no code mode.
@@ -77,14 +66,14 @@ export function catalogHash(changes) {
 /**
  * Append provider entries to an upstream `/models` payload, skipping slugs already present.
  *
- * With `forceMultiAgentV1`, upstream entries that declare `multi_agent_version: "v2"` are served as
- * `"v1"`. Codex takes the multi-agent version from the parent model's catalog entry (the
- * `features.multi_agent_v2` flag only forces v2 on, never off), and under v2 the OpenAI backend
- * returns spawn_agent arguments encrypted: the child then receives an opaque payload it cannot read.
- * v1 sends the task in plaintext, which is what a child on another provider needs.
+ * Upstream entries that declare `multi_agent_version: "v2"` are served as `"v1"`. Codex takes the
+ * multi-agent version from the parent model's catalog entry (the `features.multi_agent_v2` flag only
+ * forces v2 on, never off), and under v2 the OpenAI backend returns spawn_agent arguments encrypted:
+ * the child then receives an opaque payload it cannot read. v1 sends the task in plaintext, which is
+ * what a child on another provider needs.
  */
-export function mergeModels(upstream, entries, { forceMultiAgentV1 = true } = {}) {
-  const v1 = (m) => (forceMultiAgentV1 && m?.multi_agent_version === 'v2' ? { ...m, multi_agent_version: 'v1' } : m);
+export function mergeModels(upstream, entries) {
+  const v1 = (m) => (m?.multi_agent_version === 'v2' ? { ...m, multi_agent_version: 'v1' } : m);
   const models = (Array.isArray(upstream?.models) ? upstream.models : []).map(v1);
   const present = new Set(models.map((m) => m.slug));
   return { ...upstream, models: [...models, ...entries.filter((e) => !present.has(e.slug)).map(v1)] };

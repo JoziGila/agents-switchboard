@@ -4,7 +4,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export function createProvenance({ limit = 20_000, file = null, flushMs = 2000 } = {}) {
+/** How long a change waits before it is written out; the write is off the request path either way. */
+const FLUSH_MS = 2000;
+
+export function createProvenance({ limit = 20_000, file = null } = {}) {
   /** @type {Map<string, Set<string>>} provider -> ids (insertion order = age) */
   const byProvider = new Map();
   let dirty = false, timer = null;
@@ -25,7 +28,7 @@ export function createProvenance({ limit = 20_000, file = null, flushMs = 2000 }
         fs.mkdirSync(path.dirname(file), { recursive: true });
         fs.writeFileSync(file, JSON.stringify(Object.fromEntries([...byProvider].map(([p, ids]) => [p, [...ids]]))), { mode: 0o600 });
       } catch { /* best effort: memory stays authoritative */ }
-    }, flushMs);
+    }, FLUSH_MS);
     timer.unref?.();
   }
   function remember(provider, id) {

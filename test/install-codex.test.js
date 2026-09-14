@@ -6,10 +6,11 @@ import { parse } from 'smol-toml';
 import { applyCodexConfig, stripManaged, installCodex, uninstallCodex, findWarnings, hasManaged } from '../src/install/codex.js';
 import { tempHome, read, write } from './helpers.js';
 
-const URL = 'http://127.0.0.1:4141/backend-api/codex';
+const TOKEN = 'tok-A';
+const URL = `http://127.0.0.1:4141/_switchboard/${TOKEN}/backend-api/codex`;
 
 test('empty config gets base url, agents and features blocks', () => {
-  const out = applyCodexConfig('', 4141);
+  const out = applyCodexConfig('', 4141, { token: TOKEN });
   const cfg = parse(out);
   assert.equal(cfg.openai_base_url, URL);
   assert.equal(cfg.agents.default_subagent_model, 'deepseek-flash');
@@ -21,20 +22,20 @@ test('empty config gets base url, agents and features blocks', () => {
 
 test('top-level key lands before the first table header', () => {
   const original = 'model = "gpt-6-astra"\n\n[features]\nhooks = true\n\n[projects."/x"]\ntrust_level = "trusted"\n';
-  const out = applyCodexConfig(original, 4242);
+  const out = applyCodexConfig(original, 4242, { token: TOKEN });
   const lines = out.split('\n');
   const urlIdx = lines.findIndex((l) => l.startsWith('openai_base_url'));
   const firstHeader = lines.findIndex((l) => /^\[/.test(l));
   assert.ok(urlIdx !== -1 && urlIdx < firstHeader, 'openai_base_url must precede the first table');
   const cfg = parse(out);
-  assert.equal(cfg.openai_base_url, 'http://127.0.0.1:4242/backend-api/codex');
+  assert.equal(cfg.openai_base_url, `http://127.0.0.1:4242/_switchboard/${TOKEN}/backend-api/codex`);
   assert.equal(cfg.model, 'gpt-6-astra');
   assert.equal(cfg.projects['/x'].trust_level, 'trusted');
 });
 
 test('existing [features] and [agents] tables are merged into, not duplicated', () => {
   const original = 'model = "gpt-6-astra"\n\n[features]\nhooks = true\ncontext_management.experimental_mode = true\n\n[agents]\nmax_threads = 4\n\n[agents.reviewer]\ndescription = "x"\nconfig_file = "~/.codex/agents/reviewer.toml"\n\n[mcp_servers.foo]\nurl = "http://x"\n';
-  const out = applyCodexConfig(original, 4141);
+  const out = applyCodexConfig(original, 4141, { token: TOKEN });
   assert.equal((out.match(/^\[features\]/gm) || []).length, 1);
   assert.equal((out.match(/^\[agents\]/gm) || []).length, 1);
   const cfg = parse(out);
@@ -52,21 +53,65 @@ test('existing [features] and [agents] tables are merged into, not duplicated', 
 
 test('idempotent: applying twice yields identical text', () => {
   const original = 'model = "gpt-5.5"\n\n[features]\nhooks = true\n';
-  const once = applyCodexConfig(original, 4141);
-  const twice = applyCodexConfig(once, 4141);
+  const once = applyCodexConfig(original, 4141, { token: TOKEN });
+  const twice = applyCodexConfig(once, 4141, { token: TOKEN });
   assert.equal(twice, once);
 });
 
 test('changing the port rewrites our url rather than conflicting', () => {
-  const once = applyCodexConfig('model = "gpt-5.5"\n', 4141);
-  const moved = applyCodexConfig(once, 5000);
-  assert.equal(parse(moved).openai_base_url, 'http://127.0.0.1:5000/backend-api/codex');
+  const once = applyCodexConfig('model = "gpt-5.5"\n', 4141, { token: TOKEN });
+  const moved = applyCodexConfig(once, 5000, { token: TOKEN });
+  assert.equal(parse(moved).openai_base_url, `http://127.0.0.1:5000/_switchboard/${TOKEN}/backend-api/codex`);
   assert.equal((moved.match(/openai_base_url/g) || []).length, 1);
+});
+
+test('a capability token goes in the url path, and reinstalling with a fresh token migrates without conflict', () => {
+  const original = 'model = "gpt-5.5"\n';
+  const first = applyCodexConfig(original, 4141, { token: 'tok-A' });
+  assert.equal(parse(first).openai_base_url, 'http://127.0.0.1:4141/_switchboard/tok-A/backend-api/codex');
+
+  const rotated = applyCodexConfig(first, 4141, { token: 'tok-B' });
+  assert.equal(parse(rotated).openai_base_url, 'http://127.0.0.1:4141/_switchboard/tok-B/backend-api/codex');
+  assert.equal((rotated.match(/openai_base_url/g) || []).length, 1);
+
+  // A tokenless install from an older release is migrated the same way: its url sits in our markers, so
+  // the reinstall strips and rewrites it without a conflict.
+  const legacy = '# >>> agents-switchboard:base_url >>>\nopenai_base_url = "http://127.0.0.1:4141/backend-api/codex"\n# <<< agents-switchboard:base_url <<<\n';
+  assert.equal(parse(applyCodexConfig(legacy, 4141, { token: 'tok-C' })).openai_base_url, 'http://127.0.0.1:4141/_switchboard/tok-C/backend-api/codex');
+
+  // A user's own base url is still a conflict, and a token that cannot sit in a path is refused.
+  assert.throws(() => applyCodexConfig('openai_base_url = "https://other.example/v1"\n', 4141, { token: 'tok-A' }), /openai_base_url/);
+  assert.throws(() => applyCodexConfig(original, 4141, { token: 'bad/token' }), /base64url/);
+});
+
+test('a missing capability token is refused instead of writing the url the router answers with 400', async () => {
+  assert.throws(() => applyCodexConfig('', 4141), /access token required/);
+  assert.throws(() => applyCodexConfig('', 4141, { token: '' }), /access token required/);
+  const { paths, cleanup } = tempHome();
+  try {
+    await assert.rejects(() => installCodex({ paths, port: 4141 }), /access token required/);
+    assert.equal(fs.existsSync(path.join(paths.codexHome, 'config.toml')), false, 'the refusal happens before any write');
+  } finally { cleanup(); }
+});
+
+test('installCodex writes the capability url and uninstall restores the original bytes', async () => {
+  const { paths, cleanup } = tempHome();
+  try {
+    const file = path.join(paths.codexHome, 'config.toml');
+    const original = 'model = "gpt-6-astra"\n\n[features]\nhooks = true\n';
+    write(file, original);
+
+    await installCodex({ paths, port: 4141, token: 'tok-A' });
+    assert.equal(parse(read(file)).openai_base_url, 'http://127.0.0.1:4141/_switchboard/tok-A/backend-api/codex');
+
+    await uninstallCodex({ paths });
+    assert.equal(read(file), original);
+  } finally { cleanup(); }
 });
 
 test('stripManaged returns the original text', () => {
   const original = 'model = "gpt-5.5"\n\n[features]\nhooks = true\n\n[agents]\nmax_threads = 2\n';
-  const applied = applyCodexConfig(original, 4141);
+  const applied = applyCodexConfig(original, 4141, { token: TOKEN });
   assert.equal(stripManaged(applied).trim(), original.trim());
 });
 
@@ -81,10 +126,10 @@ test('conflicts are reported and nothing is produced', () => {
     ['agents = { max_threads = 4 }\n', 'agents written as an inline table'],
     ['features = "on"\n', 'features written as an inline table'],
   ]) {
-    assert.throws(() => applyCodexConfig(text, 4141), new RegExp(needle), text);
+    assert.throws(() => applyCodexConfig(text, 4141, { token: TOKEN }), new RegExp(needle), text);
   }
   // model_provider = "openai" is fine
-  assert.doesNotThrow(() => applyCodexConfig('model_provider = "openai"\n', 4141));
+  assert.doesNotThrow(() => applyCodexConfig('model_provider = "openai"\n', 4141, { token: TOKEN }));
 });
 
 test('installCodex writes config, roles and AGENTS.md; uninstall restores', async () => {
@@ -96,7 +141,7 @@ test('installCodex writes config, roles and AGENTS.md; uninstall restores', asyn
     write(path.join(home, 'agents', 'worker.toml'), 'name = "worker"\ndescription = "mine"\ndeveloper_instructions = "keep"\n');
     write(path.join(home, 'AGENTS.md'), '# My rules\n\nBe nice.\n');
 
-    const r1 = await installCodex({ paths, port: 4141 });
+    const r1 = await installCodex({ paths, port: 4141, token: TOKEN });
     assert.equal(r1.configChanged, true);
     assert.ok(r1.backup && fs.existsSync(r1.backup));
     assert.equal(read(r1.backup), original);
@@ -113,14 +158,14 @@ test('installCodex writes config, roles and AGENTS.md; uninstall restores', asyn
     assert.match(md, /<!-- \/agents-switchboard -->\n$/);
 
     const snapshot = { config: read(path.join(home, 'config.toml')), md, explorer };
-    const r2 = await installCodex({ paths, port: 4141 });
+    const r2 = await installCodex({ paths, port: 4141, token: TOKEN });
     assert.equal(r2.configChanged, false);
     assert.equal(r2.roles.explorer, 'unchanged');
     assert.equal(r2.agentsMd, false);
     assert.equal(read(path.join(home, 'config.toml')), snapshot.config);
     assert.equal(read(path.join(home, 'AGENTS.md')), snapshot.md);
 
-    const pro = await installCodex({ paths, port: 4141, pro: true });
+    const pro = await installCodex({ paths, port: 4141, token: TOKEN, pro: true });
     assert.equal(pro.roles.senior, 'written');
     assert.equal(parse(read(path.join(home, 'agents', 'senior.toml'))).model, 'deepseek-v4-pro');
 
@@ -140,7 +185,7 @@ test('dryRun writes nothing but previews roles and the block', async () => {
   const { paths, cleanup } = tempHome();
   try {
     write(path.join(paths.codexHome, 'agents', 'worker.toml'), 'name = "worker"\n');
-    const r = await installCodex({ paths, port: 4141, dryRun: true });
+    const r = await installCodex({ paths, port: 4141, token: TOKEN, dryRun: true });
     assert.equal(r.dryRun, true);
     assert.equal(r.roles.explorer, 'written');
     assert.equal(r.roles.worker, 'skipped');
@@ -153,13 +198,13 @@ test('dryRun writes nothing but previews roles and the block', async () => {
 });
 
 test('invalid TOML is reported by name, not as a parser stack', () => {
-  assert.throws(() => applyCodexConfig('model = \n', 4141), /config\.toml is not valid TOML/);
+  assert.throws(() => applyCodexConfig('model = \n', 4141, { token: TOKEN }), /config\.toml is not valid TOML/);
 });
 
 test('role files carry no sandbox_mode: Codex ignores it', async () => {
   const { paths, cleanup } = tempHome();
   try {
-    await installCodex({ paths, port: 4141 });
+    await installCodex({ paths, port: 4141, token: TOKEN });
     for (const name of ['explorer', 'worker', 'reviewer', 'senior']) {
       const text = read(path.join(paths.codexHome, 'agents', `${name}.toml`));
       assert.doesNotMatch(text, /sandbox_mode/);
@@ -189,6 +234,102 @@ test('uninstall is a byte-exact no-op on a file the installer never touched', as
   } finally { cleanup(); }
 });
 
+test('preexisting user keys that match the managed values are accepted, preserved and not stripped on uninstall', async () => {
+  const { paths, cleanup } = tempHome();
+  try {
+    const file = path.join(paths.codexHome, 'config.toml');
+    // The user already wrote our exact default_subagent_model and multi_agent_v2 values themselves.
+    const original = 'model = "gpt-6-astra"\n\n[agents]\ndefault_subagent_model = "deepseek-flash"\nmax_threads = 4\n\n[features]\nmulti_agent_v2 = false\nhooks = true\n';
+    write(file, original);
+
+    const r = await installCodex({ paths, port: 4141, token: 'tok-A' });
+    assert.equal(r.configChanged, true, 'install is accepted, not rejected as ambiguous');
+    const installed = parse(read(file));
+    assert.equal(installed.openai_base_url, 'http://127.0.0.1:4141/_switchboard/tok-A/backend-api/codex');
+    assert.equal(installed.agents.default_subagent_model, 'deepseek-flash');
+    assert.equal(installed.agents.max_threads, 4, 'the rest of the user table is untouched');
+
+    await uninstallCodex({ paths });
+    assert.equal(read(file), original, 'uninstall restores the original bytes');
+    const restored = parse(read(file));
+    assert.equal(restored.agents.default_subagent_model, 'deepseek-flash', 'the user keeps their own key');
+    assert.equal(restored.features.multi_agent_v2, false, 'and their own features key');
+  } finally { cleanup(); }
+});
+
+test('a user line that merely ends with the managed tag is refused instead of silently deleted', () => {
+  assert.throws(
+    () => applyCodexConfig('model = "x"\nnotes = "mine" # agents-switchboard\n', 4141, { token: TOKEN }),
+    /cannot be edited safely/,
+  );
+});
+
+test('managed-looking lines inside a multiline string are refused, not stripped', async () => {
+  const { paths, cleanup } = tempHome();
+  try {
+    const file = path.join(paths.codexHome, 'config.toml');
+    const original = 'model = "gpt-5.5"\n\n[agents]\nnote = """\nkeep\n# >>> agents-switchboard:base_url >>>\nopenai_base_url = "http://127.0.0.1:4141/backend-api/codex"\n# <<< agents-switchboard:base_url <<<\n"""\n';
+    write(file, original);
+
+    assert.throws(() => applyCodexConfig(original, 4141, { token: TOKEN }), /cannot be edited safely/);
+    await assert.rejects(() => installCodex({ paths, port: 4141, token: TOKEN }), /cannot be edited safely/);
+    await assert.rejects(() => uninstallCodex({ paths }), /cannot be edited safely/);
+    assert.equal(read(file), original, 'the refusal happens before any write');
+  } finally { cleanup(); }
+});
+
+test('a fake table header inside a multiline string is refused instead of edited into the string', async () => {
+  const { paths, cleanup } = tempHome();
+  try {
+    const file = path.join(paths.codexHome, 'config.toml');
+    const original = 'model = "gpt-5.5"\n\ndescription = """\n[agents]\nnot really a table\n"""\n';
+    write(file, original);
+
+    assert.throws(() => applyCodexConfig(original, 4141, { token: TOKEN }), /cannot be edited safely/);
+    assert.equal(read(file), original);
+  } finally { cleanup(); }
+});
+
+test('a [section]-looking line inside a multiline string stays user data and the url still lands top-level', async () => {
+  const { paths, cleanup } = tempHome();
+  try {
+    const file = path.join(paths.codexHome, 'config.toml');
+    const original = 'model = "gpt-5.5"\n\ndeveloper_instructions = """\nPrefer small changes.\n\n[Example]\nDo this, then that.\n"""\n';
+    const before = parse(original).developer_instructions;
+    write(file, original);
+
+    const r = await installCodex({ paths, port: 4141, token: TOKEN });
+    const cfg = parse(read(file));
+    assert.equal(r.configChanged, true);
+    assert.equal(cfg.openai_base_url, URL, 'the router url is top-level, not swallowed by the string');
+    assert.equal(cfg.developer_instructions, before, 'the user string is unchanged');
+    assert.doesNotMatch(cfg.developer_instructions, /agents-switchboard/);
+
+    await uninstallCodex({ paths });
+    assert.equal(read(file), original, 'round trip is byte-exact');
+  } finally { cleanup(); }
+});
+
+test('blank lines inside a multiline string survive install into an existing table and uninstall', async () => {
+  const { paths, cleanup } = tempHome();
+  try {
+    const file = path.join(paths.codexHome, 'config.toml');
+    const original = 'model = "gpt-5.5"\n\n[agents]\nnote = """\nalpha\n\n\nbeta\n"""\n';
+    const before = parse(original).agents.note;
+    write(file, original);
+
+    const r = await installCodex({ paths, port: 4141, token: TOKEN });
+    const installed = parse(read(file));
+    assert.equal(r.configChanged, true);
+    assert.equal(installed.openai_base_url, URL);
+    assert.equal(installed.agents.note, before, 'the string keeps its blank lines');
+    assert.equal(installed.agents.default_subagent_model, 'deepseek-flash', 'managed keys still merge in');
+
+    await uninstallCodex({ paths });
+    assert.equal(read(file), original, 'round trip is byte-exact');
+  } finally { cleanup(); }
+});
+
 test('install then uninstall round-trips the original bytes, including a file with no tables', async () => {
   for (const original of [
     'model = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\n\n[features]\nhooks = true\n\n[projects."/a"]\ntrust_level = "trusted"\n',
@@ -199,7 +340,7 @@ test('install then uninstall round-trips the original bytes, including a file wi
     const { paths, cleanup } = tempHome();
     try {
       write(path.join(paths.codexHome, 'config.toml'), original);
-      await installCodex({ paths, port: 4141 });
+      await installCodex({ paths, port: 4141, token: TOKEN });
       assert.equal(hasManaged(read(path.join(paths.codexHome, 'config.toml'))), true);
       await uninstallCodex({ paths });
       assert.equal(read(path.join(paths.codexHome, 'config.toml')), original, JSON.stringify(original));

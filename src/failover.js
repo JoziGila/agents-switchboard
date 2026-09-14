@@ -1,5 +1,6 @@
 // Quota failover: when a client's own vendor says the subscription is used up, finish the turn on a
 // provider model and keep going there until the vendor's reset time (SPEC §8).
+import { resolveProvider } from './providers.js';
 
 /** Parse an epoch-seconds, epoch-millis, RFC 3339, or delta-seconds value into a Date, or null. */
 export function parseResetAt(value, now = Date.now()) {
@@ -65,13 +66,45 @@ export function createFailoverState() {
 }
 
 /**
- * Reshape a Codex body built for a responses-lite model (GPT-6 Astra) into the plain form: the
- * `additional_tools` developer item becomes `tools`. Bodies without that item are returned as is.
+ * The one failover decision both routes ask: should this request go to the fallback provider now,
+ * and on which model? `fallback` is the configured provider whenever failover is enabled and that
+ * model resolves — routes need it to know whether a 429 is worth inspecting even when not yet armed.
+ * `fallbackModel` is what crosses the wire when the request does go to the fallback (armed now, or
+ * armed by the 429 on this very response); it is `ctx.failover.model` whenever a fallback is
+ * resolved (independent of `armed`) and null otherwise — routes only read it once `fallback` is known
+ * truthy, so callers must keep using the requested `model` themselves outside that branch.
+ * @param {import('./server.js').RouteContext} ctx
+ * @param {'codex'|'claude'} client
+ * @param {string} model  the model the request asked for
+ * @returns {{ armed: boolean, fallback: import('./providers.js').Provider|null, fallbackModel: string|null }}
  */
-export function liftResponsesLite(body) {
-  const items = Array.isArray(body.input) ? body.input : [];
-  const lite = items.find((i) => i?.type === 'additional_tools');
-  if (!lite) return body;
-  const tools = [...(Array.isArray(body.tools) ? body.tools : []), ...(Array.isArray(lite.tools) ? lite.tools : [])];
-  return { ...body, tools, input: items.filter((i) => i !== lite) };
+export function plan(ctx, client, model) {
+  const fallback = ctx.failover.enabled ? resolveProvider(ctx.providers, ctx.failover.model) : null;
+  const armed = Boolean(fallback) && ctx.failover.state.isActive(client);
+  return { armed, fallback, fallbackModel: fallback ? ctx.failover.model : null };
+}
+
+/**
+ * Headers a transient 429 keeps, per client: the retry hint, plus the vendor's own usage-meter
+ * headers (`x-codex-*` for the Codex backend, `anthropic-ratelimit-*` for the Anthropic one).
+ * @type {Record<'codex'|'claude', string[]>}
+ */
+const TRANSIENT_429_HEADERS = { codex: ['retry-after', 'x-codex-'], claude: ['retry-after', 'anthropic-ratelimit-'] };
+
+const keptOn429 = (client, name) => (TRANSIENT_429_HEADERS[client] ?? []).some((p) => name === p || name.startsWith(p));
+
+/**
+ * Is this 429 a transient limit for this client (i.e. carries its retry/meter signals) rather than
+ * an exhausted subscription? The vendor's own verdict lives in `detectExhaustion`; this only reads
+ * the per-client header allow-list.
+ * @param {'codex'|'claude'} client
+ * @param {Record<string,string>} headers  response headers, lower-cased names
+ */
+export function transient429(client, headers) {
+  return Object.keys(headers ?? {}).some((name) => keptOn429(client, name));
+}
+
+/** The subset of a 429's headers to hand back to the client untouched. */
+export function transient429Headers(client, headers) {
+  return Object.fromEntries(Object.entries(headers ?? {}).filter(([name]) => keptOn429(client, name)));
 }

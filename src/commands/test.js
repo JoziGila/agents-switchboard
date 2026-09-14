@@ -37,44 +37,84 @@ export function describeHits(hits) {
   return `${hits.length} DeepSeek request(s) via the router (model ${first.model}, role ${first.role ?? 'default'}${usage})`;
 }
 
+/**
+ * Whether a logged role proves the request came from a subagent. Codex sets `x-openai-subagent` to the
+ * role name (explorer, worker, reviewer, senior) on children only, so any other value is the parent
+ * session; Claude Code marks children with `x-claude-code-agent-id`, which the route logs as `subagent`.
+ * @param {'codex'|'claude'} client
+ * @param {string|null|undefined} role
+ */
+function isSubagentRole(client, role) {
+  return client === 'claude' ? role === 'subagent' : typeof role === 'string' && role !== '' && role !== 'main';
+}
+
+/** A request the provider actually served: the router records the upstream status when the response ends. */
+function isServed(hit) {
+  return typeof hit.status === 'number' && hit.status >= 200 && hit.status < 300;
+}
+
+/**
+ * The hits that prove a subagent ran on the provider: right client, subagent role, 2xx upstream. A
+ * DeepSeek request the parent made, or one DeepSeek rejected, is not evidence the child ran there.
+ * @param {object[]} hits
+ * @param {'codex'|'claude'} client
+ */
+export function provenHits(hits, client) {
+  return hits.filter((h) => isSubagentRole(client, h.role) && isServed(h));
+}
+
+/** The child's answer to the PROMPT's 2+2 is 4, and only 4. A stray 42 is a different question. */
+const CHILD_ANSWER = /\b4\b|four/i;
+
 function runClient({ command, args }, timeoutMs) {
   return new Promise((resolve) => {
     const child = spawn(command, args(), { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CI: '1' } });
-    let output = '';
-    child.stdout.on('data', (d) => (output += d));
-    child.stderr.on('data', (d) => (output += d));
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => (stdout += d));
+    child.stderr.on('data', (d) => (stderr += d));
     const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
-    child.on('error', (e) => { clearTimeout(timer); resolve({ code: null, output: `${e.message}\n` }); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code, output }); });
+    child.on('error', (e) => { clearTimeout(timer); resolve({ code: null, stdout, stderr: `${stderr}${e.message}\n` }); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
   });
 }
 
 /**
  * Run the proof for every detected client (or the one selected with `--codex` / `--claude`).
- * A client passes when at least one DeepSeek request went through the router during its run;
- * the client's exit code is reported but does not decide the result, since Codex may exit non-zero
- * for reasons unrelated to routing (interrupted MCP servers, deprecated config keys).
+ * A client passes only when all three hold: the client exited 0, its output carries the child's answer,
+ * and the router log shows a successful DeepSeek request from a subagent role. Nothing else counts — a
+ * DeepSeek request the parent session made, a request DeepSeek rejected, or a session that died before
+ * the child answered are all reported as FAIL rather than as optimistic evidence.
  * @param {{ codex?: boolean, claude?: boolean }} [opts]
+ * @param {{ present?: Record<string, boolean>, run?: (client: object, timeoutMs: number) => Promise<{code: number|null, output: string}>, readLog?: () => string, write?: (text: string) => void }} [deps]
+ *   injection seams for tests; production callers pass only `opts`.
  * @returns {Promise<number>} exit code
  */
-export async function testCommand(opts = {}) {
+export async function testCommand(opts = {}, deps = {}) {
   const paths = resolvePaths();
-  const present = { codex: codexPresent(paths), claude: claudePresent(paths) };
+  const present = deps.present ?? { codex: codexPresent(paths), claude: claudePresent(paths) };
+  const run = deps.run ?? runClient;
+  const readLog = deps.readLog ?? (() => (fs.existsSync(paths.logFile) ? fs.readFileSync(paths.logFile, 'utf8') : ''));
+  const write = deps.write ?? ((text) => process.stdout.write(text));
   const selected = Object.keys(CLIENTS).filter((name) => present[name] && (opts.codex || opts.claude ? opts[name] : true));
-  if (!selected.length) { process.stdout.write('no client detected\n'); return 1; }
+  if (!selected.length) { write('no client detected\n'); return 1; }
 
   let allPassed = true;
   for (const name of selected) {
     const since = new Date().toISOString();
-    process.stdout.write(`${name}: spawning an explorer through a real session…\n`);
-    const result = await runClient(CLIENTS[name], CLIENT_TIMEOUT_MS);
-    const hits = deepseekHits(fs.existsSync(paths.logFile) ? fs.readFileSync(paths.logFile, 'utf8') : '', { client: name, since });
-    // Evidence must come from both ends: the router saw a provider request AND the parent reported the child's answer.
-    const answered = /\b4\b|four/i.test(result.output);
-    const passed = hits.length > 0 && answered;
+    write(`${name}: spawning a subagent through a real session…\n`);
+    const result = await run(CLIENTS[name], CLIENT_TIMEOUT_MS);
+    const hits = deepseekHits(readLog(), { client: name, since });
+    // Evidence must come from both ends: the router saw the provider serve a child request AND the client
+    // finished cleanly with the child's answer on stdout. stderr is diagnostics: a version banner or a
+    // warning there is not the child replying.
+    const proven = provenHits(hits, name);
+    const completed = result.code === 0;
+    const answered = CHILD_ANSWER.test(result.stdout);
+    const passed = proven.length > 0 && completed && answered;
     allPassed &&= passed;
-    process.stdout.write(`${name}: ${passed ? 'PASS' : 'FAIL'} — ${describeHits(hits)}; child answer ${answered ? 'received' : 'MISSING'}; client exit ${result.code ?? 'error'}\n`);
-    if (!passed) process.stdout.write(result.output.split('\n').slice(-12).join('\n') + '\n');
+    const ignored = hits.length - proven.length;
+    write(`${name}: ${passed ? 'PASS' : 'FAIL'} — ${describeHits(proven)}${ignored ? `; ${ignored} DeepSeek hit(s) ignored: no subagent role or not 2xx` : ''}; child answer ${answered ? 'received' : 'MISSING'}; client exit ${result.code ?? 'error'}\n`);
+    if (!passed) write((result.stdout + result.stderr).split('\n').slice(-12).join('\n') + '\n');
   }
   return allPassed ? 0 : 1;
 }

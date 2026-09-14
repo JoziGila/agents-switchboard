@@ -5,7 +5,7 @@ Reviewed against: openai/codex `main` @ 2f8603f (CLI 0.154.0, desktop runtime 0.
 
 ## 1. Summary
 
-`agents-switchboard` is a loopback HTTP router that sits between your coding agents and the model backends. Codex and Claude Code keep using their normal subscription logins and believe they are talking to OpenAI and Anthropic. The switchboard forwards those requests unchanged, and sends any request for a DeepSeek model to DeepSeek instead.
+`agents-switchboard` is a loopback HTTP router that sits between your coding agents and the model backends. Codex and Claude Code keep using their normal subscription logins and believe they are talking to OpenAI and Anthropic. The installer gives both clients a protected local capability URL, the switchboard forwards native-vendor requests unchanged, and sends any request for a DeepSeek model to DeepSeek instead.
 
 What you get, in both Codex (desktop and CLI) and Claude Code (desktop, CLI, IDE):
 
@@ -59,13 +59,15 @@ Captured on 2026-09-14 by pointing each client at a local listener that rejected
  Codex desktop / CLI                       agents-switchboard  127.0.0.1:4141                 upstreams
  provider = openai                       ┌────────────────────────────────────────────┐
  openai_base_url =                       │ /backend-api/codex/models ── merge catalog ─┼─▶ chatgpt.com/backend-api/codex
-   http://127.0.0.1:4141/backend-api/codex│ /backend-api/codex/responses               │
+   http://127.0.0.1:4141/_switchboard/<token>/backend-api/codex
+                                         │ /backend-api/codex/responses               │
  ───────────────────────────────────────▶│     gpt-*      ── pass-through ─────────────┼─▶ chatgpt.com/backend-api/codex/responses
                                          │     deepseek-* ── responses adapter ────────┼─▶ api.deepseek.com/responses
                                          │     other      ── pass-through ─────────────┼─▶ chatgpt.com/backend-api/codex/*
  Claude Code desktop / CLI / IDE         │                                            │
  ANTHROPIC_BASE_URL =                    │ /anthropic/v1/messages                     │
-   http://127.0.0.1:4141/anthropic       │     claude-*   ── pass-through ─────────────┼─▶ api.anthropic.com/v1/messages
+   http://127.0.0.1:4141/_switchboard/<token>/anthropic
+                                         │     claude-*   ── pass-through ─────────────┼─▶ api.anthropic.com/v1/messages
  ───────────────────────────────────────▶│     deepseek-* ── messages adapter ─────────┼─▶ api.deepseek.com/anthropic/v1/messages
                                          │ /anthropic/*   ── pass-through ─────────────┼─▶ api.anthropic.com/*
                                          │                                            │
@@ -87,6 +89,8 @@ Captured on 2026-09-14 by pointing each client at a local listener that rejected
 | `installer` | Detects which clients are present, writes their config, role files and delegation policy, registers the login service, backs up, restores. |
 | `status` | `/switchboard/status` JSON and one HTML page: routes, upstream health, failover state, tokens, cache hit ratio, estimated spend, per client and per role. |
 
+`config.access_token` is the single authority for the local capability prefix. The installer creates it with `randomBytes(32).toString('base64url')`, preserves it on reinstall, and writes `~/.agents-switchboard/config.toml` with user-only permissions. Runtime code derives protected URLs through `routerBaseUrl(config)`, which returns `http://<listen>/_switchboard/<token>` and throws a reinstall-guidance error if a caller needs a protected URL but the token is missing.
+
 Runtime: Node 22+, no native modules, single npm package `agents-switchboard`, binary `switchboard`. Every Codex and Claude Code user already has npm.
 
 ## 4. Routing
@@ -95,17 +99,19 @@ Runtime: Node 22+, no native modules, single npm package `agents-switchboard`, b
 
 | Client | Request | Upstream | Handling |
 |---|---|---|---|
-| Codex | `GET /backend-api/codex/models` | OpenAI | Proxy, merge catalog, rewrite ETag (§5.1). |
-| Codex | `POST /backend-api/codex/responses`, DeepSeek model | DeepSeek | Responses adapter (§6). |
-| Codex | `POST /backend-api/codex/responses`, other model | OpenAI | Pass-through; failover hook (§8). |
+| Codex | `GET /_switchboard/<token>/backend-api/codex/models` | OpenAI | Proxy, merge catalog, rewrite ETag (§5.1). |
+| Codex | `POST /_switchboard/<token>/backend-api/codex/responses`, DeepSeek model | DeepSeek | Responses adapter (§6). |
+| Codex | `POST /_switchboard/<token>/backend-api/codex/responses`, other model | OpenAI | Pass-through; failover hook (§8). |
 | Codex | WebSocket upgrade on `/responses` | none | 426; Codex drops to HTTP for that session (§7). The upgrade carries `x-codex-routing-hint`, so phase 3 can splice GPT sockets through. |
-| Codex | anything else under `/backend-api/codex/` | OpenAI | Pass-through: usage, compaction, realtime, connectors, memories. |
-| Claude | `POST /anthropic/v1/messages`, DeepSeek model | DeepSeek | Messages adapter (§6). |
-| Claude | `POST /anthropic/v1/messages`, other model | Anthropic | Pass-through; failover hook (§8). |
-| Claude | `POST /anthropic/v1/messages/count_tokens`, DeepSeek model | local | 404. Claude Code falls back to its character estimate. |
-| Claude | `HEAD /anthropic/api/hello` | local | 200. Connection-warming probe. |
-| Claude | anything else under `/anthropic/` | Anthropic | Pass-through. |
+| Codex | anything else under `/_switchboard/<token>/backend-api/codex/` | OpenAI | Pass-through: usage, compaction, realtime, connectors, memories. |
+| Claude | `POST /_switchboard/<token>/anthropic/v1/messages`, DeepSeek model | DeepSeek | Messages adapter (§6). |
+| Claude | `POST /_switchboard/<token>/anthropic/v1/messages`, other model | Anthropic | Pass-through; failover hook (§8). |
+| Claude | `POST /_switchboard/<token>/anthropic/v1/messages/count_tokens`, DeepSeek model | local | 404. Claude Code falls back to its character estimate. |
+| Claude | `HEAD /_switchboard/<token>/anthropic/api/hello` | local | 200. Connection-warming probe. |
+| Claude | anything else under `/_switchboard/<token>/anthropic/` | Anthropic | Pass-through. |
 | any | `/switchboard/*` | local | Status and control. |
+
+Legacy unprotected vendor paths (`/backend-api/codex/*`, `/anthropic/*`) fail with HTTP 400 and reinstall guidance once a token is configured, while a router that has none (started before `switchboard install`, or restored by its rollback) still serves them. Wrong local capability tokens and provider-key failures also fail with HTTP 400. Real upstream subscription 401s remain byte-for-byte pass-through so native login refresh still works. Health, status JSON and the status page stay public. Failover reset is a protected control route at `/_switchboard/<token>/switchboard/failover/reset`.
 
 A request leaves the client's own vendor only when a provider claims its model id (after stripping a Claude-style `[1m]` suffix). The rule is the id's shape, so no list has to be maintained for routing:
 
@@ -119,7 +125,7 @@ For Codex the id comes from the `x-codex-routing-hint` header, so pass-through b
 
 ### 4.2 Pass-through contract
 
-Pass-through means: method, path, query, every request header, every request byte, every response header, every response byte. The switchboard adds nothing and removes nothing. This is what keeps ChatGPT auth, `chatgpt-account-id`, `session_id`, `originator`, `x-codex-*` sticky routing, `anthropic-beta` with its OAuth capability, `anthropic-version`, `cache_control`, the system-prompt attribution block, rate-limit headers, and every future capability working without the switchboard knowing about them.
+Pass-through means: method, vendor path, query, every request header, every request byte, every response header, every response byte. The switchboard removes only the local `/_switchboard/<token>` prefix before dispatching or forwarding. This is what keeps ChatGPT auth, `chatgpt-account-id`, `session_id`, `originator`, `x-codex-*` sticky routing, `anthropic-beta` with its OAuth capability, `anthropic-version`, `cache_control`, the system-prompt attribution block, rate-limit headers, and every future capability working without the switchboard knowing about them.
 
 ### 4.3 DeepSeek-bound headers
 
@@ -231,7 +237,7 @@ Both adapters take a profile, so one code path serves every provider and the dif
 
 ## 7. WebSocket policy (Codex)
 
-The built-in OpenAI provider advertises WebSocket support and Codex tries to upgrade `/responses` once per session. The upgrade carries no model, so it cannot be routed. Version 1 declines with 426; Codex calls `force_http_fallback` and continues over HTTP with full request bodies, which is exactly what a stateless backend needs. Cost: a slower first request per session and no incremental appends for GPT traffic, which affects latency, not correctness. Version 3 accepts the upgrade, reads the first `response.create` frame to learn the model, splices GPT sockets through to `wss://chatgpt.com`, and closes DeepSeek sockets with a retryable error so only those sessions drop to HTTP. Claude Code does not use WebSockets.
+The built-in OpenAI provider advertises WebSocket support and Codex tries to upgrade `/responses` once per thread spawn. The upgrade carries the routing hint but not the request body, so it is declined with 426 and Codex calls `force_http_fallback`, continuing over HTTP with full request bodies, which is exactly what a stateless backend needs. Cost: a slower first request per thread spawn and no incremental appends for GPT traffic, which affects latency, not correctness; the 426 lines in the log are expected noise until phase 3 splices GPT sockets through. Version 3 accepts the upgrade, reads the first `response.create` frame to learn the model, splices GPT sockets through to `wss://chatgpt.com`, and closes DeepSeek sockets with a retryable error so only those sessions drop to HTTP. Claude Code does not use WebSockets.
 
 ## 8. Quota failover
 
@@ -288,13 +294,13 @@ Cache hygiene the installer applies only if the keys are absent: keep default co
 
 ## 10. Client configuration
 
-All edits are marker-guarded, idempotent, and preceded by a timestamped backup under `~/.agents-switchboard/backups/`. The installer refuses to coexist with settings that would redirect or mask the provider, reports them, and stops rather than editing around them: for Codex `profile`, `oss_provider`, a `model_provider` other than `openai`, a different `openai_base_url`, or `model_catalog_json`; for Claude Code `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `apiKeyHelper`, a different `ANTHROPIC_BASE_URL`, or any `CLAUDE_CODE_USE_*` provider flag (each would switch billing off the subscription or bypass the switchboard).
+All edits are marker-guarded, idempotent, and preceded by a timestamped backup under `~/.agents-switchboard/backups/`. The installer refuses to coexist with settings that would redirect or mask the provider, reports them, and stops rather than editing around them: for Codex `profile`, `oss_provider`, a `model_provider` other than `openai`, a different `openai_base_url`, or `model_catalog_json`; for Claude Code `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `apiKeyHelper`, a different `ANTHROPIC_BASE_URL`, or any `CLAUDE_CODE_USE_*` provider flag (each would switch billing off the subscription or bypass the switchboard). Reinstall preserves the existing `access_token`; the token is never passed in native-client argv during verification.
 
 ### 10.1 Codex: `~/.codex/config.toml`
 
 ```toml
 # >>> agents-switchboard >>>
-openai_base_url = "http://127.0.0.1:4141/backend-api/codex"
+openai_base_url = "http://127.0.0.1:4141/_switchboard/<token>/backend-api/codex"
 
 [agents]
 default_subagent_model = "deepseek-flash"
@@ -367,7 +373,7 @@ Codex applies a fixed whitelist of role fields (model, reasoning effort and summ
 ```json
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4141/anthropic",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4141/_switchboard/<token>/anthropic",
     "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-flash[1m]",
     "ANTHROPIC_CUSTOM_MODEL_OPTION": "deepseek-flash[1m]",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "DeepSeek Flash",
@@ -431,14 +437,14 @@ Do not delegate: choosing an approach, resolving ambiguity with the user, anythi
 | `test` | Codex: `codex exec` spawns an explorer; verifies from the switchboard log that a `deepseek-flash` request reached DeepSeek and from `~/.codex/state_*.sqlite` that the child recorded `model = deepseek-flash`. Claude Code: `claude -p` runs a prompt that invokes the explorer subagent; verifies a request with `x-claude-code-agent-id` and model `deepseek-flash` reached DeepSeek. Prints the evidence. |
 | `status` | Routes, failover state per client, per-model tokens, cache hit ratio per role, estimated spend today. |
 | `logs` | Tails the request log. |
-| `roles [--pro] [--reset]` | Rewrites role files for both clients. |
+| `roles [--pro]` | Rewrites role files for both clients. |
 | `failover on\|off\|reset` | Toggles or clears failover state. |
 | `serve` | Runs the router in the foreground. What the service runs. |
 | `uninstall [--purge]` | Restores each client's config (a config the installer never marked is left byte-identical), removes role files and delegation blocks, then stops and removes the service. `--purge` also deletes every provider's keychain entry and the switchboard home. |
 
 Login service: `launchd` user agent on macOS (`~/Library/LaunchAgents/dev.agents-switchboard.plist`), `systemd --user` unit on Linux, Scheduled Task at logon on Windows. `KeepAlive`, logs to `~/.agents-switchboard/switchboard.log` with size rotation.
 
-Secrets: macOS Keychain via `security`, Linux Secret Service via `secret-tool` when present, Windows PasswordVault via PowerShell. Without a keychain, the installer writes `api_key = { env = "DEEPSEEK_API_KEY" }` (or the OpenRouter equivalent) into the switchboard config and puts the key into the service definition's environment: the plist's `EnvironmentVariables`, the unit's `Environment=`, or on Windows a user-only `service.env.cmd` sourced by the task's wrapper. The definition files are user-only. The key never appears in client config, role files, logs, `install` output, or `test` output.
+Secrets: macOS Keychain via `security`, Linux Secret Service via `secret-tool` when present, Windows PasswordVault via PowerShell. Without a keychain, the installer writes `api_key = { env = "DEEPSEEK_API_KEY" }` (or the OpenRouter equivalent) into the switchboard config and puts the key into the service definition's environment: the plist's `EnvironmentVariables`, the unit's `Environment=`, or on Windows a user-only `service.env.cmd` sourced by the task's wrapper. The definition files are user-only. Provider keys never appear in client config, role files, logs, `install` output, or `test` output. The local `access_token` is not a provider key; it appears only in protected local base URLs and is stripped before logging or upstream forwarding.
 
 Switchboard config, `~/.agents-switchboard/config.toml`:
 
@@ -484,10 +490,10 @@ model = "deepseek-flash"
 ## 13. Security and privacy
 
 - Binds to `127.0.0.1` only. Any other address requires `--allow-remote`, which the installer never sets.
-- Every route, pass-through or provider, requires the client's own `Authorization` or `x-api-key` header, so a stray local process can neither reach ChatGPT or Anthropic anonymously through the router nor spend the stored DeepSeek or OpenRouter key. Tokens are not validated locally; the upstream does that. Bodies above 32 MB are answered with 413. A client that disconnects mid-stream takes the vendor connection down with it.
+- Every vendor route, pass-through or provider, requires the protected local capability URL. Every pass-through route also requires the client's own `Authorization` or `x-api-key` header, so a stray local process can neither reach ChatGPT or Anthropic anonymously through the router nor spend the stored DeepSeek or OpenRouter key. Tokens are not validated locally; the upstream does that. Bodies above 32 MB are answered with 413. A client that disconnects mid-stream takes the vendor connection down with it.
 - The ChatGPT token goes only to `chatgpt.com`, the Anthropic OAuth token only to `api.anthropic.com`, the DeepSeek key only to `api.deepseek.com`. Hosts are pinned in code and overridable only in the switchboard's own config file, created with user-only permissions.
 - Bodies are streamed, never stored. Logs hold metadata only.
-- The router never answers a client with HTTP 401. Both clients treat a 401 from their backend as an expired login and start a token refresh; observed with Codex, which reported a revoked refresh token after a single 401 from the router. A missing or rejected DeepSeek key is reported as a 400 with an explanatory message.
+- Router-owned local auth failures and missing or rejected provider keys are reported as HTTP 400 with explanatory messages. Both clients treat local 401s as expired subscription logins, but real upstream subscription 401s stay transparent so native login refresh still works.
 - This is a local transparent proxy under your own credentials, the same shape as the LLM gateways both vendors document. It is not credential sharing. Either vendor could still restrict the pattern; `doctor` detects the failure modes (rejected `version` header, rejected base URL, 401 on OAuth) and says so plainly.
 
 ## 14. Compatibility
@@ -516,7 +522,7 @@ model = "deepseek-flash"
 ## 17. Risks and open questions
 
 - Either vendor may restrict base-URL overrides with subscription auth. Mitigation: `doctor` detection, an honest README, no silent workaround.
-- Codex `force_http_fallback` after a declined upgrade is read from source, not observed; phase 1 verifies it and, if Codex retries the upgrade on every request, pulls the WebSocket splice forward.
+- Codex `force_http_fallback` after a declined upgrade was read from source; observed 2026-09-14 that Codex retries the upgrade once per thread spawn and the HTTP fallback works, so the 426 lines are expected noise until phase 3 splices GPT sockets through.
 - The subscription 429 shape for Claude Code is undocumented; failover for Claude ships only after a captured fixture.
 - DeepSeek's Responses API documents `deepseek-flash` only; V4 Pro is probed, not assumed.
 - Codex compaction for a DeepSeek main session calls the OpenAI backend and spends GPT quota until the phase 2 shim exists. Claude Code compaction is a normal `/v1/messages` call and already lands on DeepSeek.
