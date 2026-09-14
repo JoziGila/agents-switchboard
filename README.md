@@ -82,7 +82,7 @@ What the clients end up with:
 ## Troubleshooting
 
 - **"API Error: Connection refused" in Claude Code, or Codex cannot reach its backend.** The router is down. `switchboard doctor` says why; `launchctl kickstart -k gui/$UID/dev.agents-switchboard` restarts it on macOS. If you want out immediately: `switchboard uninstall`.
-- **DeepSeek models missing from the Codex picker.** Restart the desktop app; it caches the model list and revalidates by ETag on startup.
+- **DeepSeek models missing from the Codex picker, or a Codex subagent says its task was "encrypted by the vendor".** A Codex process that started before the install (usually the desktop app) still talks to chatgpt.com directly and keeps rewriting the shared models cache. Quit and reopen the Codex app; `switchboard doctor` reports this as "codex models cache served by the router".
 - **A subagent answers with "no DeepSeek API key configured".** Run `switchboard install` again and enter the key.
 - **Claude Code warns that `deepseek-flash` is not in its catalog.** Harmless; the `[1m]` suffix the installer sets tells it the real context window.
 

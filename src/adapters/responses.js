@@ -74,12 +74,27 @@ function ensureToolOutput(item, profile) {
   return empty ? { ...item, output: EMPTY_OUTPUT_PLACEHOLDER } : item;
 }
 
+const ENCRYPTED_PAYLOAD_NOTE = '[agents-switchboard: this part of the message was encrypted by the vendor and is not readable by this model. If it looks like your task is missing, report that instead of guessing.]';
+
+/**
+ * Codex delivers inter-agent traffic as `agent_message` items, a type only the OpenAI backend knows.
+ * A stateless provider sees them as a plain user message carrying the same text. An encrypted part
+ * (produced under multi-agent v2) cannot be read here; it is replaced by a note so the child says so.
+ */
+function agentMessageToUserMessage(item) {
+  const parts = (Array.isArray(item.content) ? item.content : []).map((c) =>
+    c?.type === 'encrypted_content' ? ENCRYPTED_PAYLOAD_NOTE : (c?.text ?? ''));
+  const text = parts.filter(Boolean).join('\n');
+  return { type: 'message', role: 'user', ...(item.id ? { id: item.id } : {}), content: [{ type: 'input_text', text }] };
+}
+
 function cleanInputItem(item, profile) {
   if (!item || typeof item !== 'object') return item;
   const { internal_chat_message_metadata_passthrough: _p, ...rest } = item;
   switch (rest.type) {
     case 'reasoning': return cleanReasoningItem(rest, profile);
     case 'message': return ensureAssistantContent(rest);
+    case 'agent_message': return agentMessageToUserMessage(rest);
     case 'function_call_output': return ensureToolOutput(rest, profile);
     default: return rest;
   }

@@ -17,6 +17,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - DeepSeek harness rules enforced in the adapters (effort ladders, never-null content, output placeholders, reasoning replay, thinking shape); see `docs/deepseek-standard.md`.
 - Delegation policy and role prompts rewritten for token efficiency: reading, running and reviewing go to Flash subagents that return a screenful.
 
+- Codex parent models are served as multi-agent v1 in the merged catalog and Codex `agent_message` items become plain messages for providers, so a child on another provider receives its task in plaintext instead of an OpenAI-encrypted payload.
+
 ### Safety
 - The router never answers a client with HTTP 401; both clients treat it as an expired login.
 - The installer starts the service, waits for health, and completes a real turn per client through the router before editing any client configuration.

@@ -38,7 +38,7 @@ export function createServer({ config, keyFor, logFile, log = () => {} }) {
     openai: new URL(config.upstream.openai.base_url),
     anthropic: new URL(config.upstream.anthropic.base_url),
     providers,
-    catalog: { entries, slugs: entries.map((e) => e.slug), hash: catalogHash(entries) },
+    catalog: { entries, slugs: entries.map((e) => e.slug), hash: catalogHash({ entries, forceMultiAgentV1: true }) },
     stats: createStats({ logFile }),
     provenance: createProvenance(),
     failover: { enabled: !!config.failover?.enabled, model: config.failover?.model ?? null, state: createFailoverState() },

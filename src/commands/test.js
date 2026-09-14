@@ -69,9 +69,11 @@ export async function testCommand(opts = {}) {
     process.stdout.write(`${name}: spawning an explorer through a real session…\n`);
     const result = await runClient(CLIENTS[name], CLIENT_TIMEOUT_MS);
     const hits = deepseekHits(fs.existsSync(paths.logFile) ? fs.readFileSync(paths.logFile, 'utf8') : '', { client: name, since });
-    const passed = hits.length > 0;
+    // Evidence must come from both ends: the router saw a provider request AND the parent reported the child's answer.
+    const answered = /\b4\b|four/i.test(result.output);
+    const passed = hits.length > 0 && answered;
     allPassed &&= passed;
-    process.stdout.write(`${name}: ${passed ? 'PASS' : 'FAIL'} — ${describeHits(hits)}; client exit ${result.code ?? 'error'}\n`);
+    process.stdout.write(`${name}: ${passed ? 'PASS' : 'FAIL'} — ${describeHits(hits)}; child answer ${answered ? 'received' : 'MISSING'}; client exit ${result.code ?? 'error'}\n`);
     if (!passed) process.stdout.write(result.output.split('\n').slice(-12).join('\n') + '\n');
   }
   return allPassed ? 0 : 1;

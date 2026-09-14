@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { rewriteResponsesRequest, mapDeepSeekError, usageFromResponsesEvent } from '../src/adapters/responses.js';
 import { rewriteMessagesRequest, hasUnsignedThinking, stripUnsignedThinking, normalizeSseData } from '../src/adapters/messages.js';
 import { isDeepSeekModel, mergeModels, rewriteEtag, deepseekEntries } from '../src/catalog.js';
+import * as adaptersForAgentMessage from '../src/adapters/responses.js';
 
 const codexBody = {
   model: 'deepseek-flash', instructions: 'You are Codex', stream: true, store: false,
@@ -106,8 +107,10 @@ test('catalog helpers', () => {
   assert.equal(isDeepSeekModel(null), false);
   const entries = deepseekEntries(['deepseek-flash']);
   assert.equal(entries.length, 1);
-  const merged = mergeModels({ models: [{ slug: 'gpt-5.5' }, { slug: 'deepseek-flash', display_name: 'already' }] }, entries);
+  const merged = mergeModels({ models: [{ slug: 'gpt-5.5', multi_agent_version: 'v2' }, { slug: 'deepseek-flash', display_name: 'already' }] }, entries);
   assert.deepEqual(merged.models.map((m) => m.slug), ['gpt-5.5', 'deepseek-flash']);
+  assert.equal(merged.models[0].multi_agent_version, 'v1', 'parent models are served as v1 so spawn payloads stay plaintext');
+  assert.equal(mergeModels({ models: [{ slug: 'g', multi_agent_version: 'v2' }] }, [], { forceMultiAgentV1: false }).models[0].multi_agent_version, 'v2');
   assert.equal(rewriteEtag('"abc"', 'h1'), '"abc+sbh1"');
   assert.equal(rewriteEtag(undefined, 'h1'), '"sbh1"');
 });
@@ -222,4 +225,16 @@ test('usage cost and reasoning ids from events', () => {
   assert.deepEqual(reasoningIdsFromEvent({ type: 'response.output_item.done', item: { type: 'reasoning', id: 'rs_9' } }), ['rs_9']);
   assert.deepEqual(reasoningIdsFromEvent({ type: 'response.output_item.done', item: { type: 'message', id: 'm' } }), []);
   assert.deepEqual(reasoningIdsFromEvent({ type: 'ping' }), []);
+});
+
+test('codex agent_message items become plain user messages; encrypted payloads are flagged, not dropped silently', () => {
+  const { rewriteResponsesRequest } = adaptersForAgentMessage;
+  const plain = { type: 'agent_message', id: 'amsg_1', author: '/root', recipient: '/root/x', content: [{ type: 'input_text', text: 'Message Type: NEW_TASK\nPayload:\nwhat is 2+2?' }] };
+  const enc = { type: 'agent_message', id: 'amsg_2', author: '/root', recipient: '/root/x', content: [{ type: 'input_text', text: 'Message Type: NEW_TASK\nPayload:\n' }, { type: 'encrypted_content', encrypted_content: 'gAAAA' }] };
+  const out = rewriteResponsesRequest({ model: 'deepseek-flash', input: [plain, enc] });
+  assert.equal(out.input[0].type, 'message');
+  assert.equal(out.input[0].role, 'user');
+  assert.deepEqual(out.input[0].content, [{ type: 'input_text', text: 'Message Type: NEW_TASK\nPayload:\nwhat is 2+2?' }]);
+  assert.equal(out.input[1].type, 'message');
+  assert.match(out.input[1].content[0].text, /encrypted by the vendor/);
 });

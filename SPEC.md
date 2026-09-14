@@ -131,7 +131,7 @@ Authorization is replaced with the DeepSeek key (`Authorization: Bearer` for the
 
 Codex fetches `GET {base_url}/models?client_version=…`, caches it in `~/.codex/models_cache.json`, and revalidates by ETag. The picker, the effort menu, per-model tool wiring, base instructions, and the `spawn_agent` model whitelist all derive from that list.
 
-The switchboard proxies the request, appends the bundled DeepSeek entries, and rewrites the ETag to `"<upstream-etag>+sb<catalog-hash>"` so a catalog change invalidates the cache while upstream changes still propagate. No `model_catalog_json` is written: a static catalog would freeze OpenAI's live list.
+The switchboard proxies the request, appends the provider entries, serves upstream entries marked `multi_agent_version: "v2"` as `"v1"` (see §10.1 for why), and rewrites the ETag to `"<upstream-etag>+sb<hash>"` over everything it changed, so any change invalidates the app's cache while upstream changes still propagate. No `model_catalog_json` is written: a static catalog would freeze OpenAI's live list.
 
 The bundled entries (`catalog/deepseek.models.json`) are the ones DeepSeek ships in its own Codex setup script (`cdn.deepseek.com/api-docs/codex-deepseek-setup-en.sh` v1.3.0), carried verbatim because they encode DeepSeek's tested choices:
 
@@ -305,7 +305,7 @@ The installer brings the router up and proves a real turn per client through it 
 
 The installer does not write this as one literal block: TOML puts a top-level key after any table header inside that table, and a second `[features]` header is an error. It inserts `openai_base_url` on its own marker-guarded line before the first table header, merges the `[agents]` and `[features]` keys into existing tables when present, and appends the tables inside the block otherwise. The parsed result is exactly the above. A managed key already present with a different value is reported as a conflict, not overwritten.
 
-`multi_agent_v2` stays off in phase 1: v2 leans on server-side turn state and incremental appends that only the OpenAI backend implements, while v1 sends complete histories. Re-enabling is a phase 3 verification item.
+`multi_agent_v2 = false` alone does not keep Codex on v1. The flag only forces v2 on; with it off, Codex takes the version from the parent model's catalog entry (`multi_agent_version_for_model` in `core/src/config/mod.rs`), and GPT‑6 Astra's entry says v2. Under v2 the parent's `spawn_agent` arguments come back from the OpenAI backend encrypted (`encrypted_function_args`), and the child receives an `agent_message` whose payload is an `encrypted_content` block only that backend can read. Observed live: a DeepSeek explorer answered that its task contained no question. The router therefore serves every upstream entry that declares `multi_agent_version: "v2"` as `"v1"` in the merged models list (§5.1). Under v1 the task travels in plaintext, and the adapter turns `agent_message` items into ordinary user messages, since no other provider knows that item type. The config flag stays as a belt-and-braces guard against enabling v2 by hand.
 
 Role files in `~/.codex/agents/`, named after the built-in roles so they replace them:
 

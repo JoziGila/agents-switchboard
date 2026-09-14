@@ -69,14 +69,23 @@ export function entriesFor(providers) {
   return out;
 }
 
-/** Short stable hash of the injected entries, used to fork the upstream ETag. */
-export function catalogHash(entries) {
-  return createHash('sha256').update(JSON.stringify(entries)).digest('hex').slice(0, 8);
+/** Short stable hash of everything the router changes in the catalog, used to fork the upstream ETag. */
+export function catalogHash(changes) {
+  return createHash('sha256').update(JSON.stringify(changes)).digest('hex').slice(0, 8);
 }
 
-/** Append DeepSeek entries to an upstream `/models` payload, skipping slugs already present. */
-export function mergeModels(upstream, entries) {
-  const models = Array.isArray(upstream?.models) ? upstream.models : [];
+/**
+ * Append provider entries to an upstream `/models` payload, skipping slugs already present.
+ *
+ * With `forceMultiAgentV1`, upstream entries that declare `multi_agent_version: "v2"` are served as
+ * `"v1"`. Codex takes the multi-agent version from the parent model's catalog entry (the
+ * `features.multi_agent_v2` flag only forces v2 on, never off), and under v2 the OpenAI backend
+ * returns spawn_agent arguments encrypted: the child then receives an opaque payload it cannot read.
+ * v1 sends the task in plaintext, which is what a child on another provider needs.
+ */
+export function mergeModels(upstream, entries, { forceMultiAgentV1 = true } = {}) {
+  const models = (Array.isArray(upstream?.models) ? upstream.models : []).map((m) =>
+    forceMultiAgentV1 && m?.multi_agent_version === 'v2' ? { ...m, multi_agent_version: 'v1' } : m);
   const present = new Set(models.map((m) => m.slug));
   return { ...upstream, models: [...models, ...entries.filter((e) => !present.has(e.slug))] };
 }

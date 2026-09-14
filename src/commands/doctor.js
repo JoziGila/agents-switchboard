@@ -85,6 +85,14 @@ const CHECKS = [
   { name: 'codex openai_base_url points at router', when: (c) => c.detected.codex.present, run: (c) => c.codexToml.includes(`openai_base_url = "${codexUrl(c.port)}"`) },
   { name: 'codex default_subagent_model set', when: (c) => c.detected.codex.present, run: (c) => /default_subagent_model\s*=\s*"deepseek-/.test(c.codexToml) },
   { name: 'codex logged in (ChatGPT)', when: (c) => c.detected.codex.present, run: (c) => fs.existsSync(path.join(c.paths.codexHome, 'auth.json')) },
+  { name: 'codex models cache served by the router', when: (c) => c.detected.codex.present, run: (c) => {
+    let cache = null;
+    try { cache = JSON.parse(fs.readFileSync(`${c.paths.codexHome}/models_cache.json`, 'utf8')); } catch { return { ok: false, detail: 'no models cache yet; start a Codex session' }; }
+    const viaRouter = /\+sb[0-9a-f]{8}"$/.test(cache.etag ?? '');
+    const v2Parent = (cache.models ?? []).some((m) => m.multi_agent_version === 'v2' && !/^deepseek-|\//.test(m.slug));
+    if (viaRouter && !v2Parent) return true;
+    return { ok: false, detail: 'a Codex process started before install (usually the desktop app) is still talking to chatgpt.com directly and rewrites this cache; quit and reopen the Codex app' };
+  } },
   { name: 'codex role files', when: (c) => c.detected.codex.present, run: (c) => roleFilesExist(path.join(c.paths.codexHome, 'agents'), '.toml') },
 
   { name: 'claude version in range', when: (c) => c.detected.claude.present, run: (c) => ({ ok: !c.detected.claude.version || semverGte(c.detected.claude.version, MIN_CLAUDE), detail: `${c.detected.claude.version ?? 'unknown'} (supported ${c.pkg.switchboard.claudeRange})` }) },
