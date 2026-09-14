@@ -3,10 +3,10 @@
 Run your coding agents' **subagents on DeepSeek V4.1 Flash** while the main session keeps the GPT or Claude model from your subscription. Works with **Codex** (desktop and CLI) and **Claude Code** (desktop, CLI, IDE). One command configures both.
 
 ```
-git clone https://github.com/JoziGila/agents-switchboard && cd agents-switchboard
-npm ci
-node bin/switchboard.js install
+npx github:JoziGila/agents-switchboard install
 ```
+
+or from a checkout: `git clone https://github.com/JoziGila/agents-switchboard && cd agents-switchboard && npm ci && node bin/switchboard.js install`. (npm release to follow.)
 
 Verified on 2026-09-14 with Codex 0.154 and Claude Code 2.1.270: an explorer subagent spawned from a GPT‑6 session ran 14 requests on DeepSeek Flash with a 94% prefix-cache hit ratio, and a Claude Code explorer ran on Flash too, for under one cent in total.
 
@@ -82,7 +82,7 @@ What the clients end up with:
 ## Troubleshooting
 
 - **"API Error: Connection refused" in Claude Code, or Codex cannot reach its backend.** The router is down. `switchboard doctor` says why; `launchctl kickstart -k gui/$UID/dev.agents-switchboard` restarts it on macOS. If you want out immediately: `switchboard uninstall`.
-- **DeepSeek models missing from the Codex picker, or a Codex subagent says its task was "encrypted by the vendor".** A Codex process that started before the install (usually the desktop app) still talks to chatgpt.com directly and keeps rewriting the shared models cache. Quit and reopen the Codex app; `switchboard doctor` reports this as "codex models cache served by the router".
+- **DeepSeek models missing from the Codex picker, or a Codex subagent says its task was "encrypted by the vendor".** A Codex process that started before the install (usually the desktop app) still talks to chatgpt.com directly and keeps rewriting the shared models cache. Quit the Codex app, then `pkill -f 'codex.*app-server'` (the app-server survives an app quit as a daemon); `switchboard doctor` reports this as "codex models cache served by the router" and lists the stale process ids.
 - **A subagent answers with "no DeepSeek API key configured".** Run `switchboard install` again and enter the key.
 - **Claude Code warns that `deepseek-flash` is not in its catalog.** Harmless; the `[1m]` suffix the installer sets tells it the real context window.
 

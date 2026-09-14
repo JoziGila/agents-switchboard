@@ -1,5 +1,6 @@
 // `switchboard doctor`: a data-driven list of health checks with one line of output each.
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { probeProvider } from '../adapters/probe.js';
 import { buildProviders } from '../providers.js';
@@ -85,13 +86,29 @@ const CHECKS = [
   { name: 'codex openai_base_url points at router', when: (c) => c.detected.codex.present, run: (c) => c.codexToml.includes(`openai_base_url = "${codexUrl(c.port)}"`) },
   { name: 'codex default_subagent_model set', when: (c) => c.detected.codex.present, run: (c) => /default_subagent_model\s*=\s*"deepseek-/.test(c.codexToml) },
   { name: 'codex logged in (ChatGPT)', when: (c) => c.detected.codex.present, run: (c) => fs.existsSync(path.join(c.paths.codexHome, 'auth.json')) },
+  { name: 'no codex process predates the install', when: (c) => c.detected.codex.present && process.platform !== 'win32', run: (c) => {
+    // A Codex app-server that started before the install still talks to the vendor directly and rewrites the shared models cache.
+    let installedAt = 0;
+    try { installedAt = fs.statSync(c.paths.stateFile).mtimeMs; } catch { return true; }
+    const stale = [];
+    try {
+      const out = execFileSync('ps', ['-axo', 'pid=,lstart=,command='], { encoding: 'utf8' });
+      for (const line of out.split('\n')) {
+        if (!/codex.* app-server/.test(line) || /agents-switchboard/.test(line)) continue;
+        const [pid, ...rest] = line.trim().split(/\s+/);
+        const started = Date.parse(rest.slice(0, 5).join(' '));
+        if (Number.isFinite(started) && started < installedAt) stale.push(pid);
+      }
+    } catch { return true; }
+    return stale.length ? { ok: false, detail: `pid ${stale.join(', ')} started before the install; quit the Codex app and run: pkill -f 'codex.*app-server'` } : true;
+  } },
   { name: 'codex models cache served by the router', when: (c) => c.detected.codex.present, run: (c) => {
     let cache = null;
     try { cache = JSON.parse(fs.readFileSync(`${c.paths.codexHome}/models_cache.json`, 'utf8')); } catch { return { ok: false, detail: 'no models cache yet; start a Codex session' }; }
     const viaRouter = /\+sb[0-9a-f]{8}"$/.test(cache.etag ?? '');
     const v2Parent = (cache.models ?? []).some((m) => m.multi_agent_version === 'v2' && !/^deepseek-|\//.test(m.slug));
     if (viaRouter && !v2Parent) return true;
-    return { ok: false, detail: 'a Codex process started before install (usually the desktop app) is still talking to chatgpt.com directly and rewrites this cache; quit and reopen the Codex app' };
+    return { ok: false, detail: "a Codex process started before the install is still talking to chatgpt.com directly and rewrites this cache; quit the Codex app, run: pkill -f 'codex.*app-server', then start a new session" };
   } },
   { name: 'codex role files', when: (c) => c.detected.codex.present, run: (c) => roleFilesExist(path.join(c.paths.codexHome, 'agents'), '.toml') },
 
