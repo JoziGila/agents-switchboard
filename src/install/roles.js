@@ -30,7 +30,7 @@ export function codexRoles({ pro = false } = {}) {
   return {
     explorer: {
       description: 'Fast, read-only codebase exploration on DeepSeek Flash: find files, trace call paths, summarise modules, answer questions about existing code. Several explorers can run in parallel on independent questions.',
-      model: 'deepseek-flash', effort: 'low',
+      model: 'deepseek-flash', effort: 'high',
     },
     worker: {
       description: 'Implementation on DeepSeek Flash for bounded, fully specified changes: a function, a test, a migration, a refactor within one module. Assign it ownership of specific files; other agents may edit the same tree in parallel, so it never reverts or reformats code it did not write, and it reports the files it touched.',
@@ -81,7 +81,7 @@ export function claudeRoles({ pro = false } = {}) {
   return {
     explorer: {
       description: 'Fast, read-only codebase exploration on DeepSeek Flash. Use for finding files, tracing call paths, summarising modules, answering questions about existing code. Several explorers can run in parallel on independent questions.',
-      model: 'deepseek-flash[1m]', tools: readOnly, effort: 'low',
+      model: 'deepseek-flash[1m]', tools: readOnly, effort: 'high',
     },
     worker: {
       description: 'Implementation on DeepSeek Flash for bounded, fully specified changes: a function, a test, a migration, a refactor within one module. Assign it ownership of specific files; other agents may edit the same tree in parallel, so it never reverts or reformats code it did not write, and it reports the files it touched.',
@@ -95,7 +95,7 @@ export function claudeRoles({ pro = false } = {}) {
     // main model and ignore CLAUDE_CODE_SUBAGENT_MODEL (sub-agents docs, "Built-in subagents").
     Explore: {
       description: 'Fast agent specialized for exploring codebases. Use for file discovery, code search, and codebase exploration. Runs on DeepSeek Flash.',
-      model: 'deepseek-flash[1m]', tools: readOnly, effort: 'low',
+      model: 'deepseek-flash[1m]', tools: readOnly, effort: 'high',
     },
     Plan: {
       description: 'Codebase research for planning. Read-only. Runs on DeepSeek Flash.',

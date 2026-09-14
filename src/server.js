@@ -1,5 +1,6 @@
 // The loopback router: one HTTP server, three route families, no state beyond counters.
 import http from 'node:http';
+import path from 'node:path';
 import { entriesFor, catalogHash } from './catalog.js';
 import { buildProviders } from './providers.js';
 import { createProvenance } from './provenance.js';
@@ -40,7 +41,7 @@ export function createServer({ config, keyFor, logFile, log = () => {} }) {
     providers,
     catalog: { entries, slugs: entries.map((e) => e.slug), hash: catalogHash({ entries, forceMultiAgentV1: true }) },
     stats: createStats({ logFile }),
-    provenance: createProvenance(),
+    provenance: createProvenance({ file: logFile ? path.join(path.dirname(logFile), 'provenance.json') : null }),
     failover: { enabled: !!config.failover?.enabled, model: config.failover?.model ?? null, state: createFailoverState() },
     log,
   };

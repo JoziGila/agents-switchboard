@@ -175,7 +175,7 @@ DeepSeek Responses API: only `function` tools plus the `apply_patch` custom tool
 Request rewrite:
 
 1. `include`: remove `reasoning.encrypted_content`; drop the key if empty.
-2. `input`: delete `encrypted_content` from every `reasoning` item; remove items left empty. Relevant when a child is spawned with `fork_turns` from a GPT parent. Reasoning text that DeepSeek itself returned is never touched: DeepSeek recovers a turn's thinking signature by hashing that exact text, and its own harness replays it on every turn for that reason (docs/research/deepseek-harness-learnings.md).
+2. `input`: a `reasoning` item is replayed only to the provider that produced it, tracked by item id in the provenance store (persisted to `~/.agents-switchboard/provenance.json` so a router restart keeps a live conversation's own reasoning). Foreign items are dropped: after a mid-conversation switch from GPT‑6 to DeepSeek, GPT's reasoning items carry `content` that DeepSeek rejects (`Invalid 'input[7].content': array too long`), and a GPT parent's encrypted items are unreadable anyway. The provider's own reasoning text is never touched: DeepSeek recovers a turn's thinking signature by hashing that exact text, and its own harness replays it on every turn for that reason (docs/research/deepseek-harness-learnings.md).
 3. `tools`: keep `function` and the `apply_patch` custom tool. Members of a `namespace` wrapper (Codex's collaboration tools, MCP servers) are sent as flat functions named `<namespace>__<name>`, and calls the model makes to them are decoded back into Codex's `namespace` + `name` on the way out, using the exact map built from the request rather than string parsing, since MCP namespaces already contain `__`. History `function_call` items get the same encoding. Remove `web_search`, `image_generation`.
 4. Remove `store`, `prompt_cache_key`, `service_tier`, `safety_identifier`, `text`, `client_metadata`, and each input item's `internal_chat_message_metadata_passthrough`. DeepSeek would ignore them; removing keeps the body identical across requests. Bodies arrive zstd-compressed and are re-sent as plain JSON.
 5. `reasoning.effort`: pass low, high, max; map medium → high, xhigh → max, ultra → max.
@@ -319,7 +319,7 @@ Role files in `~/.codex/agents/`, named after the built-in roles so they replace
 name = "explorer"
 description = "Fast, read-only codebase exploration on DeepSeek Flash: find files, trace call paths, summarise modules, answer questions about existing code. Several explorers can run in parallel on independent questions."
 model = "deepseek-flash"
-model_reasoning_effort = "low"
+model_reasoning_effort = "high"
 developer_instructions = """
 You are an explorer. Answer the parent's question about the codebase with file paths and line references. Read as much as you need; report only what the parent needs: a direct answer first, then the evidence, at most a screenful. Do not modify files. Do not speculate beyond what you read. Other explorers may be answering other questions in parallel; stay on yours.
 """
@@ -390,12 +390,12 @@ name: explorer
 description: Fast, read-only codebase exploration on DeepSeek Flash. Use for finding files, tracing call paths, summarising modules, answering questions about existing code. Several explorers can run in parallel on independent questions.
 model: deepseek-flash[1m]
 tools: Read, Grep, Glob, Bash
-effort: low
+effort: high
 ---
 You are an explorer. Answer the parent's question about the codebase with file paths and line references. Read as much as you need; report only what the parent needs: a direct answer first, then the evidence, at most a screenful. Do not modify files. Do not speculate beyond what you read. Other explorers may be answering other questions in parallel; stay on yours.
 ```
 
-`worker` (model `deepseek-flash[1m]`, all tools, `effort: high`), `reviewer` (read-only tools, `effort: high`) and `senior` (model `inherit`, so it runs on whatever frontier model the session uses) follow the same pattern with the instructions from §10.1. Claude Code's built-in `Explore` and `Plan` agents do not follow `CLAUDE_CODE_SUBAGENT_MODEL`: they inherit the main model. A user agent with the same name replaces the built-in and keeps its own model, so the installer also writes `Explore.md` (`effort: low`) and `Plan.md` (`effort: high`) on Flash. Claude reaches for Explore on its own many times per session, which makes this the largest single saving on the Claude side. The frontmatter `effort` flows through the Messages adapter onto DeepSeek's `low | high | max` ladder.
+`worker` (model `deepseek-flash[1m]`, all tools, `effort: high`), `reviewer` (read-only tools, `effort: high`) and `senior` (model `inherit`, so it runs on whatever frontier model the session uses) follow the same pattern with the instructions from §10.1. Claude Code's built-in `Explore` and `Plan` agents do not follow `CLAUDE_CODE_SUBAGENT_MODEL`: they inherit the main model. A user agent with the same name replaces the built-in and keeps its own model, so the installer also writes `Explore.md` and `Plan.md` (both `effort: high`) on Flash. Claude reaches for Explore on its own many times per session, which makes this the largest single saving on the Claude side. The frontmatter `effort` flows through the Messages adapter onto DeepSeek's `low | high | max` ladder.
 
 ### 10.3 Delegation policy
 

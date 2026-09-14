@@ -277,3 +277,17 @@ test('anthropic usage: message_delta with only output_tokens does not zero earli
   const merged = { ...start, ...delta };
   assert.deepEqual(merged, { input: 40912, cached: 40000, output: 250 });
 });
+
+test('reasoning from another provider is dropped; the provider\'s own is replayed (model switch mid-conversation)', () => {
+  const { rewriteResponsesRequest, DEEPSEEK_RESPONSES } = adaptersForAgentMessage;
+  const own = new Set(['rs_ds_1']);
+  const profile = { ...DEEPSEEK_RESPONSES, ownsReasoning: (i) => own.has(i.id) };
+  const input = [
+    { type: 'reasoning', id: 'rs_gpt_7', summary: [{ type: 'summary_text', text: 'gpt thought' }], content: [{ type: 'reasoning_text', text: 'raw' }], encrypted_content: 'E' },
+    { type: 'reasoning', id: 'rs_ds_1', summary: [{ type: 'summary_text', text: 'ds thought' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+  ];
+  const out = rewriteResponsesRequest({ model: 'deepseek-flash', input }, profile);
+  assert.deepEqual(out.input.map((i) => i.id ?? i.type), ['rs_ds_1', 'message']);
+  assert.equal(rewriteResponsesRequest({ model: 'deepseek-flash', input }, DEEPSEEK_RESPONSES).input.length, 3, 'without a provenance hook nothing is dropped');
+});

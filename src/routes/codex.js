@@ -12,8 +12,17 @@ export function codexRoutes(ctx) {
   const { openai, providers, catalog, stats, provenance, failover, log } = ctx;
 
   function profileFor(provider) {
-    if (provider.name === 'openrouter') return { ...OPENROUTER_RESPONSES, keepEncryptedContent: (item) => provenance.has('openrouter', item.id) };
-    return DEEPSEEK_RESPONSES;
+    const ownsReasoning = (item) => provenance.has(provider.name, item.id);
+    if (provider.name === 'openrouter') return { ...OPENROUTER_RESPONSES, ownsReasoning, keepEncryptedContent: ownsReasoning };
+    return { ...DEEPSEEK_RESPONSES, ownsReasoning };
+  }
+
+  /** A provider 400 that names an input index gets the offending item logged, which is what a bug report needs. */
+  function logRejectedItem(provider, text, rewritten) {
+    const m = /input\[(\d+)\]/.exec(text);
+    if (!m) return;
+    const item = rewritten.input?.[Number(m[1])];
+    log(`${provider.name} rejected input[${m[1]}]: ${text.slice(0, 200)} :: item ${JSON.stringify(item)?.slice(0, 400)}`);
   }
 
   /** GET /models: proxy upstream, append the provider entries, fork the ETag. */
@@ -43,7 +52,9 @@ export function codexRoutes(ctx) {
     try { up = await upstreamRequest(url, { method: 'POST', headers: providerHeaders(req.headers, url, { ...provider.authHeaders('responses', key), ...extra.headers }, payload.length), body: payload }); }
     catch (e) { sendJson(res, 502, { error: { type: 'server_error', message: `switchboard: ${provider.name} unreachable: ${e.message}` } }); stats.record({ ...entry, error: e.message }); return; }
     if (up.statusCode < 200 || up.statusCode >= 300) {
-      const mapped = mapUpstreamError(up.statusCode, (await readResponse(up)).toString('utf8'), provider.name);
+      const text = (await readResponse(up)).toString('utf8');
+      if (up.statusCode === 400) logRejectedItem(provider, text, rewritten);
+      const mapped = mapUpstreamError(up.statusCode, text, provider.name);
       sendJson(res, mapped.status, mapped.body);
       stats.record({ ...entry, status: up.statusCode, ms: Date.now() - t0 });
       return;

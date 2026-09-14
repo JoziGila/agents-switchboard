@@ -7,6 +7,7 @@ import { baseModelId } from '../catalog.js';
  * @property {string[]|null} effortLevels        the provider's effort ladder, or null to pass efforts through
  * @property {string[]} customTools              custom tool names the provider accepts
  * @property {(item: object) => boolean} keepEncryptedContent  whether a reasoning item may keep `encrypted_content`
+ * @property {(item: object) => boolean} [ownsReasoning]  whether this provider produced the reasoning item; foreign items are dropped (a model switch mid-conversation otherwise sends GPT reasoning to DeepSeek, which rejects its `content`)
  * @property {boolean} placeholderEmptyOutput    replace empty tool output with a placeholder
  */
 
@@ -110,6 +111,7 @@ function pushTool(out, t, profile) {
 
 /** Harness rule: reasoning text is replayed byte-exact; only the encrypted payload is provider-bound. */
 function cleanReasoningItem(item, profile) {
+  if (profile.ownsReasoning && !profile.ownsReasoning(item)) return null;
   if (item.encrypted_content != null && profile.keepEncryptedContent(item)) return item;
   const { encrypted_content: _e, ...r } = item;
   const hasSummary = Array.isArray(r.summary) && r.summary.length > 0;
